@@ -1,0 +1,19 @@
+# Backend: только FastAPI
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+# multipart/form-data: загрузка файлов (UploadFile, Form) — без этого Starlette падает с AssertionError
+python-multipart>=0.0.9
+asyncpg>=0.29.0
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+
+# DB reflection / migrations
+sqlalchemy>=2.0.0
+alembic>=1.13.0
+psycopg[binary]>=3.2.0
+
+# Scheduler (deadline automations)
+apscheduler>=3.10.0
+
+# Optional: files (S3)
+boto3>=1.35.0

@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: kaiten
+      POSTGRES_USER: kaiten
+      POSTGRES_PASSWORD: kaiten
+    volumes:
+      - kaiten_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kaiten"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    volumes:
+      - ./backend:/app
+    environment:
+      DATABASE_URL: postgresql://kaiten:kaiten@db:5432/kaiten
+      SECRET_KEY: dev-secret-key-change-me
+      MEDIA_ROOT: /app/media
+      MEDIA_URL: /media/
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: uvicorn fastapi_app.main:app --host 0.0.0.0 --port 8000
+
+volumes:
+  kaiten_db_data:
