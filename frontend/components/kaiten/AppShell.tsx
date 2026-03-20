@@ -44,7 +44,7 @@ export type AppShellSpace = { id: string; name: string };
 export type AppShellBoard = { id: string; name: string; space_id?: string; project_id?: string };
 export type AppShellProject = { id: string; name: string; space_id?: string };
 export type AddAction = "folder" | "space" | "storymap" | "document" | "board";
-export type AppRole = "user" | "manager" | "lead" | "admin";
+export type AppRole = "user" | "executor" | "manager" | "lead" | "admin";
 export type AppNotification = {
   id: string;
   title: string;
@@ -88,8 +88,11 @@ type Props = {
   onSelectBoard: (boardId: string) => void;
   /** true если переименование на сервере прошло успешно */
   onRenameSpace?: (spaceId: string, newName: string) => void | Promise<boolean>;
+  onRenameBoard?: (boardId: string, newName: string) => void | Promise<boolean>;
   /** Удаление пространства (lead/admin). Вернуть false при ошибке — диалог останется открытым. */
   onDeleteSpace?: (spaceId: string) => boolean | Promise<boolean> | void | Promise<void>;
+  /** Удаление доски (manager+). Вернуть false при ошибке — диалог останется открытым. */
+  onDeleteBoard?: (boardId: string) => boolean | Promise<boolean> | void | Promise<void>;
 
   onLogout: () => void;
 
@@ -136,7 +139,9 @@ export default function AppShell({
   onSelectProject,
   onSelectBoard,
   onRenameSpace,
+  onRenameBoard,
   onDeleteSpace,
+  onDeleteBoard,
   onLogout,
   activeTabId = "lists",
   onTabChange,
@@ -220,9 +225,10 @@ export default function AppShell({
 
   const activeSpaceName = spaces.find((s) => s.id === activeSpaceId)?.name ?? "Первое пространство";
   const currentViewMode = VIEW_MODES.find((v) => v.id === viewMode) || VIEW_MODES[0];
-  const canCreateEntities = currentUserRole !== "user";
+  const canCreateEntities = currentUserRole !== "user" && currentUserRole !== "executor";
   const canCreateSpace = currentUserRole === "lead" || currentUserRole === "admin";
   const canManageSpaces = canManageCurrentSpace ?? canCreateSpace;
+  const canManageBoards = canCreateEntities;
   const canOpenAdministration = currentUserRole === "admin";
 
   const handleToggleSidebarPin = () => {
@@ -751,7 +757,9 @@ export default function AppShell({
               onSelectBoard={onSelectBoard}
               onCreateSpace={() => onCreateSpaceClick?.()}
               onRenameSpace={onRenameSpace}
+              onRenameBoard={onRenameBoard}
               onDeleteSpace={onDeleteSpace}
+              onDeleteBoard={onDeleteBoard}
               onLogout={onLogout}
               isPinned={sidebarPinned}
               onTogglePin={handleToggleSidebarPin}
@@ -762,6 +770,7 @@ export default function AppShell({
               canCreateEntities={canCreateEntities}
               canCreateSpace={canCreateSpace}
               canManageSpaces={canManageSpaces}
+              canManageBoards={canManageBoards}
             />
           </Box>
         ) : (
@@ -801,7 +810,9 @@ export default function AppShell({
                 handleCloseSidebar();
               }}
               onRenameSpace={onRenameSpace}
+              onRenameBoard={onRenameBoard}
               onDeleteSpace={onDeleteSpace}
+              onDeleteBoard={onDeleteBoard}
               onLogout={() => {
                 handleCloseSidebar();
                 onLogout();
@@ -816,6 +827,7 @@ export default function AppShell({
               canCreateEntities={canCreateEntities}
               canCreateSpace={canCreateSpace}
               canManageSpaces={canManageSpaces}
+              canManageBoards={canManageBoards}
             />
           </Drawer>
         )}

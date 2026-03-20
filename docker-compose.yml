@@ -24,6 +24,14 @@ services:
       SECRET_KEY: dev-secret-key-change-me
       MEDIA_ROOT: /app/media
       MEDIA_URL: /media/
+      # Почта: задайте в корневом `.env` (см. `.env.example`). Compose подставляет переменные автоматически.
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-465}
+      SMTP_SSL: ${SMTP_SSL:-1}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-}
+      SMTP_FROM_NAME: ${SMTP_FROM_NAME:-}
     ports:
       - "8000:8000"
     depends_on:

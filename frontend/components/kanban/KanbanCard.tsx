@@ -35,6 +35,8 @@ import BugReportOutlinedIcon from "@mui/icons-material/BugReportOutlined";
 import LightbulbOutlinedIcon from "@mui/icons-material/LightbulbOutlined";
 import { normalizeTaskCardType } from "./cardTaskTypes";
 import { normalizeKanbanPriority } from "@/lib/kanbanPriority";
+import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 type Card = {
   id: string;
@@ -45,6 +47,9 @@ type Card = {
   planned_end_at?: string | null;
   track_id?: string | null;
   column_id: string;
+  unread_comments_count?: number;
+  comments_count?: number;
+  attachments_count?: number;
 };
 
 type TimeEntry = {
@@ -142,6 +147,22 @@ function formatDueDate(due_at: string | null, locale: "ru" | "en") {
   return { text: `${day} ${month}`, isOverdue };
 }
 
+function extractFirstImageUrl(markdown: string): string | null {
+  const mdMatch = markdown.match(/!\[[^\]]*]\((?:<)?([^)\s>]+)(?:>)?(?:\s+["'][^"']*["'])?\)/i);
+  if (mdMatch?.[1]) return mdMatch[1];
+
+  const htmlImgMatch = markdown.match(/<img[^>]+src=["']([^"']+)["'][^>]*>/i);
+  if (htmlImgMatch?.[1]) return htmlImgMatch[1];
+
+  return null;
+}
+
+function toCardPreviewImageUrl(rawUrl: string): string {
+  if (/^https?:\/\//i.test(rawUrl)) return rawUrl;
+  if (rawUrl.startsWith("/")) return getApiUrl(rawUrl);
+  return rawUrl;
+}
+
 type Props = {
   card: Card;
   token: string;
@@ -152,6 +173,7 @@ type Props = {
   onDuplicate?: (cardId: string) => void;
   onArchive?: (cardId: string) => void;
   commentsCount?: number;
+  unreadCommentsCount?: number;
   attachmentsCount?: number;
   isFavorite?: boolean;
   priority?: "Терпит" | "Средний" | "Срочно" | string | null;
@@ -172,6 +194,7 @@ function KanbanCardComponent({
   onDuplicate,
   onArchive,
   commentsCount = 0,
+  unreadCommentsCount = 0,
   attachmentsCount = 0,
   isFavorite = false,
   priority = null,
@@ -198,8 +221,9 @@ function KanbanCardComponent({
 
   const style: CSSProperties = {
     transform: transform ? `translate3d(${transform.x}px, ${transform.y}px, 0)` : undefined,
-    opacity: isDragging ? 0.5 : 1,
-    zIndex: isDragging ? 1000 : 1,
+    /* Полупрозрачная копия уходит под соседние ячейки grid; визуал только в DragOverlay (портал) */
+    opacity: isDragging ? 0 : 1,
+    pointerEvents: isDragging ? "none" : undefined,
   };
 
   const [menuAnchor, setMenuAnchor] = useState<null | HTMLElement>(null);
@@ -306,6 +330,18 @@ function KanbanCardComponent({
   const dueInfo = formatDueDate(plannedEndAt ?? card.due_at, locale);
   const displayTags = useMemo(() => normalizeKanbanTags(tags), [tags]);
   const displayPriority = useMemo(() => normalizeKanbanPriority(priority), [priority]);
+  const coverImageUrl = useMemo(() => {
+    const rawImageUrl = extractFirstImageUrl(card.description);
+    return rawImageUrl ? toCardPreviewImageUrl(rawImageUrl) : null;
+  }, [card.description]);
+  const descriptionWithoutImages = useMemo(
+    () =>
+      card.description
+        .replace(/!\[[^\]]*]\((?:<)?([^)\s>]+)(?:>)?(?:\s+["'][^"']*["'])?\)/gi, "")
+        .replace(/<img[^>]*>/gi, "")
+        .trim(),
+    [card.description]
+  );
   const daysLeft = useMemo(() => {
     if (!plannedEndAt && !card.due_at) return null;
     const target = new Date((plannedEndAt ?? card.due_at) as string);
@@ -336,6 +372,12 @@ function KanbanCardComponent({
     }
     return { bgcolor: "#475569", icon: <FlagIcon sx={{ fontSize: 14, color: "#fff" }} /> };
   }, [displayPriority]);
+  const assigneeDisplayName = useMemo(() => {
+    const raw = (assigneeName || "").trim();
+    if (!raw) return "";
+    return raw.replace(/^["']+/, "").replace(/["']+$/, "");
+  }, [assigneeName]);
+  const assigneeInitial = assigneeDisplayName ? assigneeDisplayName.charAt(0).toUpperCase() : "?";
 
   return (
     <Box
@@ -480,23 +522,53 @@ function KanbanCardComponent({
         </Box>
       )}
 
-      {/* Описание (если есть) */}
-      {card.description && (
-        <Typography
+      {coverImageUrl ? (
+        <Box
           sx={{
-            fontSize: 12,
-            color: "var(--k-text-muted)",
-            lineHeight: 1.4,
             mb: 1,
-            display: "-webkit-box",
-            WebkitLineClamp: 2,
-            WebkitBoxOrient: "vertical",
+            borderRadius: 1,
             overflow: "hidden",
+            border: "1px solid var(--k-border)",
+            height: 150,
+            bgcolor: "var(--k-page-bg)",
           }}
         >
-          {card.description}
-        </Typography>
-      )}
+          <Box
+            component="img"
+            src={coverImageUrl}
+            alt=""
+            sx={{
+              width: "100%",
+              height: "100%",
+              objectFit: "cover",
+              display: "block",
+            }}
+          />
+        </Box>
+      ) : null}
+
+      {/* Описание в markdown (до 5 строк) */}
+      {descriptionWithoutImages ? (
+        <Box
+          sx={{
+            mb: 1,
+            color: "var(--k-text-muted)",
+            fontSize: 12,
+            lineHeight: 1.4,
+            overflow: "hidden",
+            maxHeight: "calc(1.4em * 5)",
+            "& p": { m: 0 },
+            "& p + p": { mt: 0.5 },
+            "& ul, & ol": { m: 0, pl: 2 },
+            "& li": { mb: 0.25 },
+            "& a": { color: "#A020F0", textDecoration: "underline" },
+            "& strong": { color: "var(--k-text)", fontWeight: 700 },
+            "& img": { display: "none" },
+          }}
+        >
+          <Markdown remarkPlugins={[remarkGfm]}>{descriptionWithoutImages}</Markdown>
+        </Box>
+      ) : null}
 
       {/* Нижняя строка: метаданные */}
       <Box sx={{ display: "flex", alignItems: "center", gap: 1, flexWrap: "wrap", mt: 1 }}>
@@ -564,9 +636,27 @@ function KanbanCardComponent({
         {/* Комментарии */}
         {commentsCount > 0 && (
           <Tooltip title={locale === "en" ? "Comments" : "Комментарии"}>
-            <Box sx={{ display: "flex", alignItems: "center", gap: 0.25, color: "var(--k-text-muted)" }}>
+            <Box sx={{ display: "flex", alignItems: "center", gap: 0.25, color: "var(--k-text-muted)", position: "relative" }}>
               <ChatBubbleOutlineIcon sx={{ fontSize: 14 }} />
               <Typography sx={{ fontSize: 11 }}>{commentsCount}</Typography>
+              {unreadCommentsCount > 0 ? (
+                <Box
+                  sx={{
+                    minWidth: 16,
+                    height: 16,
+                    px: 0.5,
+                    borderRadius: "999px",
+                    bgcolor: "#dc2626",
+                    color: "#fff",
+                    fontSize: 10,
+                    lineHeight: "16px",
+                    textAlign: "center",
+                    fontWeight: 700,
+                  }}
+                >
+                  {unreadCommentsCount}
+                </Box>
+              ) : null}
             </Box>
           </Tooltip>
         )}
@@ -628,7 +718,7 @@ function KanbanCardComponent({
           <PersonOutlineIcon sx={{ fontSize: 14, color: "var(--k-text-muted)" }} />
         </Box>
       </Box>
-      {(blockingCount > 0 || blockedCount > 0 || assigneeName) && (
+      {(blockingCount > 0 || blockedCount > 0 || assigneeDisplayName) && (
         <Box sx={{ mt: 1, display: "flex", flexDirection: "column", gap: 0.5 }}>
           {blockingCount > 0 ? (
             <Box sx={{ px: 1, py: 0.5, borderRadius: 0, bgcolor: "rgba(239,68,68,0.12)", fontSize: 11, color: "#F97316" }}>
@@ -636,12 +726,65 @@ function KanbanCardComponent({
             </Box>
           ) : null}
           {blockedCount > 0 ? (
-            <Box sx={{ px: 1, py: 0.5, borderRadius: 0, bgcolor: "rgba(251,191,36,0.14)", fontSize: 11, color: "#FBBF24" }}>
-              {`✋ ${blockedCount} блокировка`}
-            </Box>
+            blockedCount > 1 ? (
+              <Box
+                component="button"
+                type="button"
+                sx={{
+                  px: 1,
+                  py: 0.5,
+                  borderRadius: 0.5,
+                  bgcolor: "rgba(251,191,36,0.14)",
+                  fontSize: 11,
+                  color: "#FBBF24",
+                  border: "1px solid rgba(251,191,36,0.35)",
+                  textAlign: "left",
+                }}
+              >
+                {`✋ ${blockedCount} блокировки`}
+              </Box>
+            ) : (
+              <Box sx={{ px: 1, py: 0.5, borderRadius: 0, bgcolor: "rgba(251,191,36,0.14)", fontSize: 11, color: "#FBBF24" }}>
+                {"✋ 1 блокировка"}
+              </Box>
+            )
           ) : null}
-          {assigneeName ? (
-            <Box sx={{ fontSize: 11, color: "var(--k-text-muted)" }}>{assigneeName}</Box>
+          {assigneeDisplayName ? (
+            <Box
+              sx={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 0.75,
+                px: 0.75,
+                py: 0.5,
+                borderRadius: 1,
+                border: "1px solid var(--k-border)",
+                bgcolor: "rgba(127,127,127,0.1)",
+                width: "fit-content",
+                maxWidth: "100%",
+              }}
+            >
+              <Box
+                sx={{
+                  width: 18,
+                  height: 18,
+                  borderRadius: "50%",
+                  background: "linear-gradient(90deg, #8A2BE2, #4B0082)",
+                  color: "#fff",
+                  fontSize: 10,
+                  fontWeight: 700,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  flexShrink: 0,
+                }}
+              >
+                {assigneeInitial}
+              </Box>
+              <Box sx={{ fontSize: 11, color: "var(--k-text-muted)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                {assigneeDisplayName}
+              </Box>
+            </Box>
           ) : null}
         </Box>
       )}

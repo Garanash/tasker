@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import Any
 
 import asyncpg
@@ -12,6 +13,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Request, Response as FastAPIResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.staticfiles import StaticFiles
 from jose import JWTError, jwt
 from starlette import status
 
@@ -118,6 +120,11 @@ app.include_router(auth_router)
 app.include_router(kanban_router)
 app.include_router(docs_router)
 app.include_router(notifications_router)
+
+# Раздача загруженных файлов (аватары, вложения): /media/...
+_media_root = os.environ.get("MEDIA_ROOT", "/tmp/kaiten_media")
+Path(_media_root).mkdir(parents=True, exist_ok=True)
+app.mount("/media", StaticFiles(directory=_media_root), name="media")
 
 
 @app.get("/health/live")

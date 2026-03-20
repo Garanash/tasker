@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, useMemo } from "react";
 import {
   Avatar,
   Box,
@@ -13,6 +13,7 @@ import {
   TextField,
   Typography,
 } from "@mui/material";
+import EditOutlinedIcon from "@mui/icons-material/EditOutlined";
 import { getApiUrl } from "@/lib/api";
 import type { AppLanguage } from "@/lib/preferences";
 
@@ -31,6 +32,13 @@ type Props = {
   onSaved: (next: { full_name: string; avatar_url: string }) => void;
 };
 
+function resolveAvatarDisplayUrl(avatarUrl: string): string | undefined {
+  const u = avatarUrl.trim();
+  if (!u) return undefined;
+  if (u.startsWith("http://") || u.startsWith("https://")) return u;
+  return getApiUrl(u.startsWith("/") ? u : `/${u}`);
+}
+
 export default function ProfileSettingsDialog({
   open,
   onClose,
@@ -46,27 +54,51 @@ export default function ProfileSettingsDialog({
   const [fullName, setFullName] = useState(initialFullName);
   const [avatarUrl, setAvatarUrl] = useState(initialAvatarUrl);
   const [loading, setLoading] = useState(false);
+  const [avatarUploading, setAvatarUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loginCodeBusy, setLoginCodeBusy] = useState(false);
+  const [loginCodeInfo, setLoginCodeInfo] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const t =
     language === "en"
       ? {
           title: "Profile settings",
           name: "Display name",
-          avatarHint: "Avatar image URL (https://…)",
+          changeAvatarAction: "Click avatar to choose a photo from your device",
           cancel: "Cancel",
           save: "Save",
           nameRequired: "Enter a display name",
           urlTooLong: "Avatar URL is too long",
+          uploadFailed: "Could not upload avatar",
+          invalidType: "Use JPEG, PNG, WebP or GIF",
+          fileTooLarge: "File is too large (max 5 MB)",
+          requestLoginCode: "Send one-time login code",
+          requestLoginCodeHint:
+            "A 6-digit code will be sent to your email. Use it on the sign-in page under “Sign in with code”.",
+          codeSent: "If mail is configured, check your inbox (code valid 15 min).",
+          codeSending: "Sending…",
+          codeFailed: "Could not send code",
+          mailNotConfigured: "Email is not configured on the server (SMTP).",
         }
       : {
           title: "Настройки профиля",
           name: "Отображаемое имя",
-          avatarHint: "URL картинки аватара (https://…)",
+          changeAvatarAction: "Нажмите на аватар, чтобы выбрать фото с компьютера",
           cancel: "Отмена",
           save: "Сохранить",
           nameRequired: "Укажите имя",
           urlTooLong: "Слишком длинный URL аватара",
+          uploadFailed: "Не удалось загрузить аватар",
+          invalidType: "Допустимы JPEG, PNG, WebP или GIF",
+          fileTooLarge: "Файл слишком большой (максимум 5 МБ)",
+          requestLoginCode: "Сбросить пароль — код на почту",
+          requestLoginCodeHint:
+            "На email придёт 6-значный код. На экране входа выберите «Вход по коду» и введите его вместо пароля.",
+          codeSent: "Если почта настроена на сервере, проверьте письмо (код действует 15 минут).",
+          codeSending: "Отправка…",
+          codeFailed: "Не удалось отправить код",
+          mailNotConfigured: "На сервере не настроена почта (SMTP).",
         };
 
   useEffect(() => {
@@ -74,7 +106,78 @@ export default function ProfileSettingsDialog({
     setFullName(initialFullName);
     setAvatarUrl(initialAvatarUrl);
     setError(null);
+    setLoginCodeInfo(null);
   }, [open, initialFullName, initialAvatarUrl]);
+
+  const avatarSrc = useMemo(() => resolveAvatarDisplayUrl(avatarUrl), [avatarUrl]);
+
+  const uploadAvatarRequest = async (accessToken: string, file: File) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    return fetch(getApiUrl("/api/auth/me/avatar"), {
+      method: "POST",
+      headers: { Authorization: `Bearer ${accessToken}` },
+      body: fd,
+    });
+  };
+
+  const mapUploadError = (detail: unknown): string => {
+    if (detail === "invalid_file_type") return t.invalidType;
+    if (detail === "file_too_large") return t.fileTooLarge;
+    if (detail === "empty_file") return t.uploadFailed;
+    if (typeof detail === "string") return detail;
+    return t.uploadFailed;
+  };
+
+  const handleAvatarFile = async (file: File | undefined | null) => {
+    if (!file || avatarUploading) return;
+    setAvatarUploading(true);
+    setError(null);
+    try {
+      let accessToken = token;
+      let res = await uploadAvatarRequest(accessToken, file);
+      let data: any = await res.json().catch(() => ({}));
+
+      if (!res.ok && res.status === 401 && data?.detail === "invalid_token") {
+        if (!refreshToken) {
+          onAuthExpired?.();
+          throw new Error(language === "en" ? "Session expired. Sign in again." : "Сессия истекла. Войдите заново.");
+        }
+        const refreshRes = await fetch(getApiUrl("/api/auth/refresh"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ refresh: refreshToken }),
+        });
+        const refreshData: any = await refreshRes.json().catch(() => ({}));
+        if (!refreshRes.ok || !refreshData?.access) {
+          onAuthExpired?.();
+          throw new Error(language === "en" ? "Session expired. Sign in again." : "Сессия истекла. Войдите заново.");
+        }
+        onTokensUpdated?.({ access: refreshData.access, refresh: refreshData.refresh });
+        accessToken = refreshData.access;
+        res = await uploadAvatarRequest(accessToken, file);
+        data = await res.json().catch(() => ({}));
+      }
+
+      if (!res.ok) {
+        throw new Error(mapUploadError(data?.detail));
+      }
+      const u = data?.user;
+      const nextUrl = u ? String(u.avatar_url ?? "") : "";
+      if (nextUrl) {
+        setAvatarUrl(nextUrl);
+        onSaved({
+          full_name: fullName.trim(),
+          avatar_url: nextUrl,
+        });
+      }
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAvatarUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
 
   const patchProfile = async (accessToken: string) =>
     fetch(getApiUrl("/api/auth/me"), {
@@ -146,13 +249,62 @@ export default function ProfileSettingsDialog({
     }
   };
 
+  const postRequestLoginCode = (accessToken: string) =>
+    fetch(getApiUrl("/api/auth/me/request-login-code"), {
+      method: "POST",
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+  const handleRequestLoginCode = async () => {
+    setLoginCodeBusy(true);
+    setError(null);
+    setLoginCodeInfo(null);
+    try {
+      let res = await postRequestLoginCode(token);
+      let data: any = await res.json().catch(() => ({}));
+      if (!res.ok && res.status === 401 && data?.detail === "invalid_token") {
+        if (!refreshToken) {
+          onAuthExpired?.();
+          throw new Error(language === "en" ? "Session expired. Sign in again." : "Сессия истекла. Войдите заново.");
+        }
+        const refreshRes = await fetch(getApiUrl("/api/auth/refresh"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ refresh: refreshToken }),
+        });
+        const refreshData: any = await refreshRes.json().catch(() => ({}));
+        if (!refreshRes.ok || !refreshData?.access) {
+          onAuthExpired?.();
+          throw new Error(language === "en" ? "Session expired. Sign in again." : "Сессия истекла. Войдите заново.");
+        }
+        onTokensUpdated?.({ access: refreshData.access, refresh: refreshData.refresh });
+        res = await postRequestLoginCode(refreshData.access);
+        data = await res.json().catch(() => ({}));
+      }
+      if (!res.ok) {
+        if (data?.detail === "mail_not_configured") {
+          setError(t.mailNotConfigured);
+          return;
+        }
+        throw new Error(typeof data?.detail === "string" ? data.detail : t.codeFailed);
+      }
+      setLoginCodeInfo(t.codeSent);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoginCodeBusy(false);
+    }
+  };
+
   const previewLetter = (fullName.trim() || "?").charAt(0).toUpperCase();
+  const busy = loading || avatarUploading;
+  const codeSectionBusy = loginCodeBusy;
 
   return (
     <Dialog
       open={open}
       onClose={() => {
-        if (loading) return;
+        if (busy) return;
         onClose();
       }}
       fullWidth
@@ -169,27 +321,116 @@ export default function ProfileSettingsDialog({
         },
       }}
     >
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/jpeg,image/png,image/webp,image/gif,.jpg,.jpeg,.png,.webp,.gif"
+        style={{ display: "none" }}
+        aria-hidden
+        onChange={(e) => void handleAvatarFile(e.target.files?.[0])}
+      />
       <DialogTitle sx={{ fontWeight: 800, letterSpacing: "-0.02em" }}>{t.title}</DialogTitle>
       <DialogContent sx={{ display: "flex", flexDirection: "column", gap: 2, pt: 1 }}>
         <Box sx={{ display: "flex", alignItems: "center", gap: 2, py: 1 }}>
-          <Avatar
-            src={avatarUrl.trim() || undefined}
+          <Box
+            role="button"
+            tabIndex={0}
+            aria-label={t.changeAvatarAction}
+            aria-busy={avatarUploading}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (busy) return;
+              fileInputRef.current?.click();
+            }}
+            onKeyDown={(e) => {
+              if (busy) return;
+              if (e.key !== "Enter" && e.key !== " ") return;
+              e.preventDefault();
+              fileInputRef.current?.click();
+            }}
             sx={{
-              width: 72,
-              height: 72,
-              fontSize: 28,
-              fontWeight: 700,
-              background: "linear-gradient(90deg, #8A2BE2, #4B0082)",
+              position: "relative",
+              borderRadius: "50%",
+              cursor: busy ? "default" : "pointer",
+              flexShrink: 0,
+              "&:hover .avatar-edit-overlay": { opacity: avatarUploading ? 0 : 1 },
             }}
           >
-            {previewLetter}
-          </Avatar>
+            <Avatar
+              src={avatarSrc}
+              sx={{
+                width: 72,
+                height: 72,
+                fontSize: 28,
+                fontWeight: 700,
+                background: "linear-gradient(90deg, #8A2BE2, #4B0082)",
+              }}
+            >
+              {previewLetter}
+            </Avatar>
+            {avatarUploading ? (
+              <Box
+                sx={{
+                  position: "absolute",
+                  inset: 0,
+                  borderRadius: "50%",
+                  bgcolor: "rgba(0,0,0,0.5)",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                <CircularProgress size={28} sx={{ color: "#fff" }} />
+              </Box>
+            ) : (
+              <Box
+                className="avatar-edit-overlay"
+                sx={{
+                  position: "absolute",
+                  inset: 0,
+                  borderRadius: "50%",
+                  bgcolor: "rgba(0,0,0,0.45)",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  opacity: 0,
+                  transition: "opacity 0.2s ease",
+                  pointerEvents: "none",
+                }}
+              >
+                <EditOutlinedIcon sx={{ color: "#fff", fontSize: 20 }} />
+              </Box>
+            )}
+          </Box>
           <Typography variant="body2" sx={{ color: "var(--k-text-muted, #A0A0A0)" }}>
-            {language === "en" ? "Preview updates as you type the image URL." : "Превью обновляется при вводе URL картинки."}
+            {t.changeAvatarAction}
           </Typography>
         </Box>
-        <TextField label={t.name} value={fullName} onChange={(e) => setFullName(e.target.value)} fullWidth autoFocus disabled={loading} />
-        <TextField label={t.avatarHint} value={avatarUrl} onChange={(e) => setAvatarUrl(e.target.value)} fullWidth disabled={loading} />
+        <TextField label={t.name} value={fullName} onChange={(e) => setFullName(e.target.value)} fullWidth autoFocus disabled={busy} />
+        <Box sx={{ borderTop: "1px solid var(--k-border)", pt: 2, mt: 0.5 }}>
+          <Typography variant="body2" sx={{ color: "var(--k-text-muted)", mb: 1.5 }}>
+            {t.requestLoginCodeHint}
+          </Typography>
+          <Button
+            variant="outlined"
+            onClick={() => void handleRequestLoginCode()}
+            disabled={busy || codeSectionBusy}
+            sx={{
+              borderRadius: 999,
+              textTransform: "none",
+              borderColor: "var(--k-border)",
+              color: "var(--k-text)",
+              "&:hover": { borderColor: "#9C27B0", bgcolor: "rgba(156,39,176,0.08)" },
+            }}
+          >
+            {loginCodeBusy ? t.codeSending : t.requestLoginCode}
+          </Button>
+          {loginCodeInfo ? (
+            <Typography variant="body2" sx={{ color: "var(--k-text-muted)", mt: 1.5 }}>
+              {loginCodeInfo}
+            </Typography>
+          ) : null}
+        </Box>
         {error ? (
           <Typography variant="body2" color="error">
             {error}
@@ -197,13 +438,13 @@ export default function ProfileSettingsDialog({
         ) : null}
       </DialogContent>
       <DialogActions sx={{ px: 3, pb: 2, gap: 1 }}>
-        <Button onClick={onClose} disabled={loading} sx={{ color: "var(--k-text-muted, #A0A0A0)" }}>
+        <Button onClick={onClose} disabled={busy} sx={{ color: "var(--k-text-muted, #A0A0A0)" }}>
           {t.cancel}
         </Button>
         <Button
           variant="contained"
           onClick={() => void handleSave()}
-          disabled={loading}
+          disabled={busy}
           sx={{
             borderRadius: 999,
             px: 3,

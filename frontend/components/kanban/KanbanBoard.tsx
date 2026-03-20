@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, useCallback, memo, type KeyboardEvent } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback, memo, type KeyboardEvent, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import {
   DndContext,
   DragOverlay,
@@ -47,6 +48,9 @@ import CategoryOutlinedIcon from "@mui/icons-material/CategoryOutlined";
 import RuleFolderOutlinedIcon from "@mui/icons-material/RuleFolderOutlined";
 import ListAltOutlinedIcon from "@mui/icons-material/ListAltOutlined";
 import DoneAllOutlinedIcon from "@mui/icons-material/DoneAllOutlined";
+import VisibilityOffOutlinedIcon from "@mui/icons-material/VisibilityOffOutlined";
+import EditIcon from "@mui/icons-material/Edit";
+import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 
 type Card = {
   id: string;
@@ -64,8 +68,11 @@ type Card = {
   assignee_user_id?: string | null;
   blocked_count?: number;
   blocking_count?: number;
+  comments_count?: number;
+  unread_comments_count?: number;
+  attachments_count?: number;
 };
-type OrgMember = { id: string; email: string; full_name: string; role: "user" | "manager" | "lead" | "admin" };
+type OrgMember = { id: string; email: string; full_name: string; role: "user" | "executor" | "manager" | "lead" | "admin" };
 
 type Column = {
   id: string;
@@ -78,6 +85,7 @@ type Column = {
 
 type BoardGrid = {
   board: { id: string; name: string };
+  effective_role?: "user" | "executor" | "manager" | "lead" | "admin";
   tracks: Array<{ id: string; name: string }>;
   columns: Column[];
 };
@@ -100,6 +108,16 @@ const kanbanCollisionDetection: CollisionDetection = (args) => {
   if (pointerHits.length > 0) return pointerHits;
   return closestCorners(args);
 };
+
+/** Выше ячеек сетки и MUI Modal (~1300): overlay внутри layout с transform/overflow даёт неверный stacking */
+const BOARD_DRAG_OVERLAY_Z = 10_000;
+
+function BoardDragOverlayPortal({ children }: { children: ReactNode }) {
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  if (!mounted) return null;
+  return createPortal(children, document.body);
+}
 
 const NOTIFY_STORAGE_PREFIX = "kaiten_notify_column_";
 
@@ -275,6 +293,71 @@ const ColumnDroppable = memo(function ColumnDroppable({
   );
 });
 
+const TrackCellDroppable = memo(function TrackCellDroppable({
+  droppableId,
+  children,
+  onAddCard,
+  locale = "ru",
+}: {
+  droppableId: string;
+  children: React.ReactNode;
+  onAddCard?: () => void;
+  locale?: "ru" | "en";
+}) {
+  const { setNodeRef, isOver } = useDroppable({ id: droppableId });
+  return (
+    <Box
+      ref={setNodeRef}
+      sx={{
+        p: 1,
+        borderRadius: 1.5,
+        border: isOver ? "2px solid #9C27B0" : "1px solid var(--k-border)",
+        bgcolor: "var(--k-surface-bg)",
+        minHeight: 120,
+        display: "flex",
+        flexDirection: "column",
+        gap: 0,
+        transition: "border-color 0.15s",
+        minWidth: 0,
+      }}
+    >
+      <Box
+        sx={{
+          flex: 1,
+          overflow: "auto",
+          display: "flex",
+          flexDirection: "column",
+          gap: 1,
+          minHeight: 48,
+          pb: onAddCard ? 0.5 : 0,
+        }}
+      >
+        {children}
+      </Box>
+      {onAddCard ? (
+        <Box sx={{ pt: 0.5 }}>
+          <Button
+            fullWidth
+            size="small"
+            startIcon={<AddIcon />}
+            onClick={onAddCard}
+            sx={{
+              justifyContent: "flex-start",
+              textTransform: "none",
+              color: TEXT_GRAY,
+              fontSize: 13,
+              py: 0.75,
+              "&:hover": { bgcolor: "rgba(127,127,127,0.12)" },
+            }}
+          >
+            {locale === "en" ? "Add card" : "Добавить карточку"}
+          </Button>
+        </Box>
+      ) : null}
+    </Box>
+  );
+});
+
 export function KanbanBoard({
   boardId,
   token,
@@ -290,7 +373,7 @@ export function KanbanBoard({
   activeSpaceId?: string | null;
   refreshToken?: number;
   filters?: KanbanFilters;
-  onCreateCard?: (columnId: string) => void;
+  onCreateCard?: (columnId: string, options?: { trackId: string }) => void;
   locale?: "ru" | "en";
   /** Подсветка и прокрутка к колонке (например из ?column=uuid в URL) */
   highlightColumnId?: string | null;
@@ -335,9 +418,13 @@ export function KanbanBoard({
   const [selectedLoading, setSelectedLoading] = useState(false);
   const [selectedError, setSelectedError] = useState<string | null>(null);
   const [createColumnBusy, setCreateColumnBusy] = useState(false);
+  const [createTrackBusy, setCreateTrackBusy] = useState(false);
+  const [hiddenTrackIds, setHiddenTrackIds] = useState<string[]>([]);
   /** prompt() в Cursor/встроенном браузере часто неблокирующий и сразу даёт null — переименование через Dialog */
   const [renameColumnDialog, setRenameColumnDialog] = useState<{ columnId: string; name: string } | null>(null);
   const [renameColumnBusy, setRenameColumnBusy] = useState(false);
+  const [renameTrackDialog, setRenameTrackDialog] = useState<{ trackId: string; name: string } | null>(null);
+  const [renameTrackBusy, setRenameTrackBusy] = useState(false);
 
   const [columnMenuAnchor, setColumnMenuAnchor] = useState<null | HTMLElement>(null);
   const [columnMenuColumnId, setColumnMenuColumnId] = useState<string | null>(null);
@@ -387,9 +474,13 @@ export function KanbanBoard({
     const hasQuery = query.length > 0;
     const hasStatusFilter = status !== "all";
 
-    if (!hasQuery && !hasStatusFilter) return grid.columns;
+    const sourceColumns =
+      grid.effective_role === "executor"
+        ? grid.columns.filter((col) => col.name.trim() !== "Задачи")
+        : grid.columns;
+    if (!hasQuery && !hasStatusFilter) return sourceColumns;
 
-    return grid.columns.map((col) => {
+    return sourceColumns.map((col) => {
       let cards = col.cards;
 
       if (hasStatusFilter) {
@@ -410,6 +501,31 @@ export function KanbanBoard({
     });
   }, [grid, normalizedFilters]);
 
+  const createTrack = useCallback(async () => {
+    if (createTrackBusy || !grid) return;
+    const name = window.prompt(locale === "en" ? "Track name" : "Название дорожки", locale === "en" ? "New track" : "Новая дорожка");
+    if (!name || !name.trim()) return;
+    setCreateTrackBusy(true);
+    try {
+      const res = await fetch(getApiUrl(`/api/kanban/boards/${grid.board.id}/tracks`), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
+        },
+        body: JSON.stringify({ name: name.trim() }),
+      });
+      const data = (await res.json().catch(() => null)) as { detail?: string } | null;
+      if (!res.ok) throw new Error(data?.detail ?? (locale === "en" ? "Could not create track" : "Не удалось создать дорожку"));
+      await fetchGrid(grid.board.id);
+    } catch (e: any) {
+      setBoardNotice(e?.message ?? (locale === "en" ? "Could not create track" : "Не удалось создать дорожку"));
+    } finally {
+      setCreateTrackBusy(false);
+    }
+  }, [createTrackBusy, grid, token, activeSpaceId, locale, fetchGrid]);
+
   const loadCardDetails = useCallback(
     async (cardId: string) => {
       setSelectedLoading(true);
@@ -422,13 +538,21 @@ export function KanbanBoard({
         if (!res.ok) throw new Error((data as any)?.detail ?? "Не удалось загрузить карточку");
         setSelectedCard({ ...data, is_favorite: favoriteCardIds.includes(cardId) });
         setSelectedCardId(cardId);
+        await fetch(getApiUrl(`/api/kanban/cards/${cardId}/comments/mark-read`), {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
+          },
+        }).catch(() => null);
+        await fetchGrid(boardId);
       } catch (e: any) {
         setSelectedError(e?.message ?? "Ошибка загрузки карточки");
       } finally {
         setSelectedLoading(false);
       }
     },
-    [token, favoriteCardIds]
+    [token, favoriteCardIds, activeSpaceId, fetchGrid, boardId]
   );
 
   const toggleFavorite = useCallback((cardId: string) => {
@@ -522,6 +646,41 @@ export function KanbanBoard({
       setRenameColumnBusy(false);
     }
   }, [renameColumnDialog, grid, locale, token, activeSpaceId, fetchGrid]);
+
+  const openRenameTrackDialog = useCallback((trackId: string, currentName: string) => {
+    setBoardNotice(null);
+    setRenameTrackDialog({ trackId, name: currentName });
+  }, []);
+
+  const submitRenameTrack = useCallback(async () => {
+    if (!renameTrackDialog || !grid) return;
+    const nextName = renameTrackDialog.name.trim();
+    if (!nextName) return;
+    const trackId = renameTrackDialog.trackId;
+    setRenameTrackBusy(true);
+    try {
+      const res = await fetch(getApiUrl(`/api/kanban/tracks/${trackId}`), {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
+        },
+        body: JSON.stringify({ name: nextName }),
+      });
+      const data = (await res.json().catch(() => null)) as { detail?: string } | null;
+      if (!res.ok) {
+        throw new Error(data?.detail ?? (locale === "en" ? "Could not rename track" : "Не удалось переименовать дорожку"));
+      }
+      setRenameTrackDialog(null);
+      await fetchGrid(grid.board.id);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setBoardNotice(msg || (locale === "en" ? "Could not rename track" : "Не удалось переименовать дорожку"));
+    } finally {
+      setRenameTrackBusy(false);
+    }
+  }, [renameTrackDialog, grid, locale, token, activeSpaceId, fetchGrid]);
 
   const closeColumnMenu = useCallback(() => {
     setColumnMenuAnchor(null);
@@ -721,7 +880,7 @@ export function KanbanBoard({
   }, [highlightColumnId, loading, grid]);
 
   const optimisticMoveCard = useCallback(
-    async (cardId: string, toColumnId: string) => {
+    async (cardId: string, toColumnId: string, toTrackId: string | null = null) => {
       if (!grid) return;
 
       const prev = structuredClone(grid) as BoardGrid;
@@ -732,7 +891,7 @@ export function KanbanBoard({
           if (col.id === toColumnId) {
             const card = prev.columns.flatMap((c) => c.cards).find((x) => x.id === cardId);
             if (!card) return col;
-            return { ...col, cards: [{ ...card, column_id: toColumnId }, ...col.cards] };
+            return { ...col, cards: [{ ...card, column_id: toColumnId, track_id: toTrackId }, ...col.cards] };
           }
           return { ...col, cards: col.cards.filter((x) => x.id !== cardId) };
         }),
@@ -746,7 +905,7 @@ export function KanbanBoard({
             Authorization: `Bearer ${token}`,
             ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
           },
-          body: JSON.stringify({ to_column_id: toColumnId, to_track_id: null }),
+          body: JSON.stringify({ to_column_id: toColumnId, to_track_id: toTrackId }),
         });
         if (!res.ok) {
           const data = (await res.json().catch(() => null)) as { detail?: string } | null;
@@ -790,6 +949,42 @@ export function KanbanBoard({
     border: "1px solid var(--k-border)",
     boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
   } as const;
+
+  const hasTracksLayout = (grid?.tracks?.length ?? 0) > 0;
+  const firstTrackId = grid?.tracks?.[0]?.id ?? null;
+  const getCardsForTrackColumn = useCallback(
+    (column: Column, trackId: string) => {
+      return column.cards.filter((card) => {
+        if (card.track_id) return card.track_id === trackId;
+        return trackId === firstTrackId;
+      });
+    },
+    [firstTrackId]
+  );
+
+  const toggleTrackVisibility = useCallback((trackId: string) => {
+    setHiddenTrackIds((prev) => (prev.includes(trackId) ? prev.filter((id) => id !== trackId) : [...prev, trackId]));
+  }, []);
+
+  const removeTrack = useCallback(
+    async (trackId: string) => {
+      if (!grid) return;
+      const ok = window.confirm(locale === "en" ? "Delete track?" : "Удалить дорожку?");
+      if (!ok) return;
+      const res = await fetch(getApiUrl(`/api/kanban/tracks/${trackId}`), {
+        method: "DELETE",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
+        },
+      });
+      const data = (await res.json().catch(() => null)) as { detail?: string } | null;
+      if (!res.ok) throw new Error(data?.detail ?? (locale === "en" ? "Could not delete track" : "Не удалось удалить дорожку"));
+      setHiddenTrackIds((prev) => prev.filter((id) => id !== trackId));
+      await fetchGrid(grid.board.id);
+    },
+    [grid, token, activeSpaceId, locale, fetchGrid]
+  );
 
   return (
     <Box sx={{ height: "100%", display: "flex", flexDirection: "column" }}>
@@ -852,6 +1047,75 @@ export function KanbanBoard({
             }}
           >
             {renameColumnBusy
+              ? locale === "en"
+                ? "Saving..."
+                : "Сохранение..."
+              : locale === "en"
+                ? "Save"
+                : "Сохранить"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(renameTrackDialog)}
+        onClose={() => {
+          if (!renameTrackBusy) setRenameTrackDialog(null);
+        }}
+        fullWidth
+        maxWidth="xs"
+        PaperProps={{
+          sx: { bgcolor: "var(--k-surface-bg)", color: "var(--k-text)", border: "1px solid var(--k-border)" },
+        }}
+      >
+        <DialogTitle sx={{ fontSize: 16, fontWeight: 700 }}>
+          {locale === "en" ? "Rename track" : "Переименовать дорожку"}
+        </DialogTitle>
+        <DialogContent>
+          <TextField
+            autoFocus
+            fullWidth
+            margin="dense"
+            label={locale === "en" ? "Track name" : "Название дорожки"}
+            value={renameTrackDialog?.name ?? ""}
+            onChange={(e) =>
+              setRenameTrackDialog((prev) => (prev ? { ...prev, name: e.target.value } : null))
+            }
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey && renameTrackDialog?.name.trim() && !renameTrackBusy) {
+                e.preventDefault();
+                void submitRenameTrack();
+              }
+            }}
+            disabled={renameTrackBusy}
+            slotProps={{
+              input: { sx: { color: "var(--k-text)" } },
+            }}
+            sx={{
+              mt: 0.5,
+              "& .MuiOutlinedInput-notchedOutline": { borderColor: "var(--k-border)" },
+              "& label": { color: "var(--k-text-muted)" },
+            }}
+          />
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button
+            onClick={() => setRenameTrackDialog(null)}
+            disabled={renameTrackBusy}
+            sx={{ color: "var(--k-text-muted)" }}
+          >
+            {locale === "en" ? "Cancel" : "Отмена"}
+          </Button>
+          <Button
+            variant="contained"
+            onClick={() => void submitRenameTrack()}
+            disabled={!renameTrackDialog?.name.trim() || renameTrackBusy}
+            sx={{
+              bgcolor: "#9C27B0",
+              "&:hover": { bgcolor: "#7B1FA2" },
+            }}
+          >
+            {renameTrackBusy
               ? locale === "en"
                 ? "Saving..."
                 : "Сохранение..."
@@ -1253,6 +1517,291 @@ export function KanbanBoard({
         >
           {locale === "en" ? "Loading board..." : "Загрузка доски..."}
         </Box>
+      ) : hasTracksLayout ? (
+        <DndContext
+          sensors={sensors}
+          collisionDetection={kanbanCollisionDetection}
+          measuring={{
+            droppable: { strategy: MeasuringStrategy.Always },
+          }}
+          onDragStart={(e) => {
+            setActiveCardId(String(e.active.id));
+            lastOverIdRef.current = null;
+          }}
+          onDragOver={(e) => {
+            const overId = e.over?.id ? String(e.over.id) : null;
+            if (overId) {
+              lastOverIdRef.current = overId;
+            }
+          }}
+          onDragEnd={(e) => {
+            const overId = e.over?.id ? String(e.over.id) : lastOverIdRef.current;
+            const activeIdStr = String(e.active.id);
+            setActiveCardId(null);
+            lastOverIdRef.current = null;
+
+            if (!overId || !grid) return;
+            if (!activeIdStr.startsWith("card:")) return;
+            const cardId = activeIdStr.slice("card:".length);
+
+            let toColumnId: string | null = null;
+            let toTrackId: string | null = null;
+            if (overId.startsWith("trackcol:")) {
+              const [, trackId, columnId] = overId.split(":");
+              toColumnId = columnId || null;
+              toTrackId = trackId || null;
+            } else if (overId.startsWith("card:")) {
+              const overCardId = overId.slice("card:".length);
+              const hostColumn = grid.columns.find((col) => col.cards.some((c) => c.id === overCardId));
+              const overCard = grid.columns.flatMap((col) => col.cards).find((c) => c.id === overCardId);
+              toColumnId = hostColumn?.id || null;
+              toTrackId = overCard?.track_id ?? firstTrackId ?? null;
+            } else if (overId.startsWith("col:")) {
+              toColumnId = overId.slice("col:".length);
+              toTrackId = firstTrackId ?? null;
+            }
+            if (!toColumnId) return;
+
+            const movingCard = grid.columns.flatMap((col) => col.cards).find((c) => c.id === cardId);
+            const fromColumn = grid.columns.find((col) => col.cards.some((c) => c.id === cardId));
+            const fromTrackId = movingCard?.track_id ?? firstTrackId ?? null;
+            if (fromColumn?.id === toColumnId && fromTrackId === toTrackId) return;
+
+            setBoardNotice(null);
+            optimisticMoveCard(cardId, toColumnId, toTrackId);
+          }}
+          onDragCancel={() => {
+            setActiveCardId(null);
+            lastOverIdRef.current = null;
+          }}
+        >
+        <Box
+          id="boardsWrapper"
+          sx={{
+            p: 2,
+            overflow: "auto",
+            flex: 1,
+            bgcolor: "var(--k-page-bg)",
+            minHeight: 0,
+          }}
+        >
+          <Box
+            sx={{
+              minWidth: Math.max(980, visibleColumns.length * 280 + (canManageColumns ? 260 : 0)),
+              flex: 1,
+              minHeight: 0,
+            }}
+          >
+            <Box
+              sx={{
+                display: "grid",
+                gridTemplateColumns:
+                  visibleColumns.map(() => "minmax(260px, 1fr)").join(" ") +
+                  (canManageColumns ? " minmax(220px, 280px)" : ""),
+                gap: 1,
+                mb: 1,
+              }}
+            >
+              {visibleColumns.map((column) => (
+                <Box
+                  key={`head-${column.id}`}
+                  sx={{
+                    p: 2,
+                    minHeight: 88,
+                    borderRadius: 1.5,
+                    border: "1px solid var(--k-border)",
+                    bgcolor: "var(--k-surface-bg)",
+                    color: "var(--k-text)",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                  }}
+                >
+                  <Typography
+                    sx={{
+                      fontSize: { xs: 16, sm: 18 },
+                      fontWeight: 800,
+                      letterSpacing: "-0.02em",
+                      lineHeight: 1.25,
+                      textAlign: "center",
+                      wordBreak: "break-word",
+                      hyphens: "auto",
+                    }}
+                  >
+                    {column.name}
+                  </Typography>
+                </Box>
+              ))}
+              {canManageColumns ? (
+                <Box
+                  sx={{
+                    p: 1.5,
+                    borderRadius: 1.5,
+                    border: "1px dashed var(--k-border)",
+                    bgcolor: "var(--k-surface-bg)",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 1,
+                    justifyContent: "center",
+                    minHeight: "100%",
+                  }}
+                >
+                  <Button
+                    variant="text"
+                    size="small"
+                    onClick={() => void createColumn()}
+                    disabled={createColumnBusy}
+                    startIcon={<AddIcon />}
+                    sx={{ textTransform: "none", color: "var(--k-text)", fontWeight: 600, justifyContent: "flex-start" }}
+                  >
+                    {createColumnBusy
+                      ? locale === "en"
+                        ? "Creating..."
+                        : "Создание..."
+                      : locale === "en"
+                        ? "Add column"
+                        : "Добавить колонку"}
+                  </Button>
+                  <Button
+                    variant="text"
+                    size="small"
+                    onClick={() => void createTrack()}
+                    disabled={createTrackBusy}
+                    startIcon={<AddIcon />}
+                    sx={{ textTransform: "none", color: "var(--k-text)", fontWeight: 600, justifyContent: "flex-start" }}
+                  >
+                    {createTrackBusy
+                      ? locale === "en"
+                        ? "Creating..."
+                        : "Создание..."
+                      : locale === "en"
+                        ? "Add row"
+                        : "Добавить дорожку"}
+                  </Button>
+                </Box>
+              ) : null}
+            </Box>
+
+            {grid!.tracks.map((track) => {
+              const isHidden = hiddenTrackIds.includes(track.id);
+              const cardsTotal = visibleColumns.reduce((sum, col) => sum + getCardsForTrackColumn(col, track.id).length, 0);
+              return (
+                <Box key={track.id} sx={{ mb: 1.25 }}>
+                  <Box
+                    sx={{
+                      height: 42,
+                      borderRadius: 1.25,
+                      border: "1px solid var(--k-border)",
+                      bgcolor: "var(--k-surface-bg)",
+                      px: 1.5,
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                    }}
+                  >
+                    <Typography sx={{ fontSize: 13, fontWeight: 700, color: "var(--k-text)" }}>
+                      {track.name} {cardsTotal}
+                    </Typography>
+                    <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                      <IconButton size="small" onClick={() => toggleTrackVisibility(track.id)} title={locale === "en" ? "Hide/show track" : "Скрыть/показать дорожку"}>
+                        <VisibilityOffOutlinedIcon sx={{ fontSize: 17, color: "var(--k-text-muted)" }} />
+                      </IconButton>
+                      <IconButton
+                        size="small"
+                        onClick={() => openRenameTrackDialog(track.id, track.name)}
+                        title={locale === "en" ? "Rename track" : "Переименовать дорожку"}
+                      >
+                        <EditIcon sx={{ fontSize: 17, color: "var(--k-text-muted)" }} />
+                      </IconButton>
+                      <IconButton size="small" onClick={() => void removeTrack(track.id)} title={locale === "en" ? "Delete track" : "Удалить дорожку"}>
+                        <DeleteOutlineIcon sx={{ fontSize: 17, color: "#d32f2f" }} />
+                      </IconButton>
+                    </Box>
+                  </Box>
+                  {!isHidden ? (
+                    <Box
+                      sx={{
+                        display: "grid",
+                        gridTemplateColumns:
+                          visibleColumns.map(() => "minmax(260px, 1fr)").join(" ") +
+                          (canManageColumns ? " minmax(220px, 280px)" : ""),
+                        gap: 1,
+                        mt: 0.75,
+                      }}
+                    >
+                      {visibleColumns.map((column) => {
+                        const trackCards = getCardsForTrackColumn(column, track.id);
+                        return (
+                          <TrackCellDroppable
+                            key={`${track.id}-${column.id}`}
+                            droppableId={`trackcol:${track.id}:${column.id}`}
+                            locale={locale}
+                            onAddCard={
+                              onCreateCard ? () => onCreateCard(column.id, { trackId: track.id }) : undefined
+                            }
+                          >
+                            {trackCards.map((card) => (
+                              <KanbanCard
+                                key={card.id}
+                                card={card}
+                                token={token}
+                                locale={locale}
+                                onOpen={loadCardDetails}
+                                isFavorite={favoriteCardIds.includes(card.id)}
+                                priority={card.priority}
+                                tags={card.tags}
+                                assigneeName={card.assignee_name}
+                                blockedCount={card.blocked_count}
+                                blockingCount={card.blocking_count}
+                                commentsCount={card.comments_count}
+                                unreadCommentsCount={card.unread_comments_count}
+                                attachmentsCount={card.attachments_count}
+                                plannedEndAt={card.planned_end_at || card.due_at}
+                              />
+                            ))}
+                          </TrackCellDroppable>
+                        );
+                      })}
+                      {canManageColumns ? (
+                        <Box
+                          aria-hidden
+                          sx={{
+                            minHeight: 120,
+                            borderRadius: 1.5,
+                            border: "1px solid transparent",
+                            bgcolor: "transparent",
+                          }}
+                        />
+                      ) : null}
+                    </Box>
+                  ) : null}
+                </Box>
+              );
+            })}
+          </Box>
+        </Box>
+          <BoardDragOverlayPortal>
+            <DragOverlay dropAnimation={null} zIndex={BOARD_DRAG_OVERLAY_Z}>
+              {activeCard ? (
+                <Box
+                  sx={{
+                    bgcolor: "var(--k-surface-bg)",
+                    border: "1px solid #9C27B0",
+                    borderRadius: 1.5,
+                    p: 1.5,
+                    boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+                    maxWidth: 280,
+                    transform: "rotate(3deg)",
+                  }}
+                >
+                  <Typography sx={{ fontSize: 14, fontWeight: 500, color: TEXT_DARK }}>
+                    {activeCard.title}
+                  </Typography>
+                </Box>
+              ) : null}
+            </DragOverlay>
+          </BoardDragOverlayPortal>
+        </DndContext>
       ) : (
         <DndContext
           sensors={sensors}
@@ -1335,6 +1884,9 @@ export function KanbanBoard({
                     assigneeName={card.assignee_name}
                     blockedCount={card.blocked_count}
                     blockingCount={card.blocking_count}
+                    commentsCount={card.comments_count}
+                    unreadCommentsCount={card.unread_comments_count}
+                    attachmentsCount={card.attachments_count}
                     plannedEndAt={card.planned_end_at || card.due_at}
                   />
                 ))}
@@ -1355,38 +1907,51 @@ export function KanbanBoard({
                   p: 2,
                 }}
               >
-                <Button
-                  variant="text"
-                  onClick={createColumn}
-                  disabled={createColumnBusy}
-                  startIcon={<AddIcon />}
-                  sx={{ textTransform: "none", color: "var(--k-text)", fontWeight: 600 }}
-                >
-                  {createColumnBusy ? (locale === "en" ? "Creating..." : "Создание...") : locale === "en" ? "Add column" : "Добавить колонку"}
-                </Button>
+                <Box sx={{ display: "flex", flexDirection: "column", gap: 1, width: "100%" }}>
+                  <Button
+                    variant="text"
+                    onClick={createColumn}
+                    disabled={createColumnBusy}
+                    startIcon={<AddIcon />}
+                    sx={{ textTransform: "none", color: "var(--k-text)", fontWeight: 600 }}
+                  >
+                    {createColumnBusy ? (locale === "en" ? "Creating..." : "Создание...") : locale === "en" ? "Add column" : "Добавить колонку"}
+                  </Button>
+                  <Button
+                    variant="text"
+                    onClick={createTrack}
+                    disabled={createTrackBusy}
+                    startIcon={<AddIcon />}
+                    sx={{ textTransform: "none", color: "var(--k-text)", fontWeight: 600 }}
+                  >
+                    {createTrackBusy ? (locale === "en" ? "Creating..." : "Создание...") : locale === "en" ? "Add row" : "Добавить дорожку"}
+                  </Button>
+                </Box>
               </Box>
             ) : null}
           </Box>
 
-          <DragOverlay dropAnimation={null}>
-            {activeCard ? (
-              <Box
-                sx={{
-                  bgcolor: "var(--k-surface-bg)",
-                  border: "1px solid #9C27B0",
-                  borderRadius: 1.5,
-                  p: 1.5,
-                  boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
-                  maxWidth: 280,
-                  transform: "rotate(3deg)",
-                }}
-              >
-                <Typography sx={{ fontSize: 14, fontWeight: 500, color: TEXT_DARK }}>
-                  {activeCard.title}
-                </Typography>
-              </Box>
-            ) : null}
-          </DragOverlay>
+          <BoardDragOverlayPortal>
+            <DragOverlay dropAnimation={null} zIndex={BOARD_DRAG_OVERLAY_Z}>
+              {activeCard ? (
+                <Box
+                  sx={{
+                    bgcolor: "var(--k-surface-bg)",
+                    border: "1px solid #9C27B0",
+                    borderRadius: 1.5,
+                    p: 1.5,
+                    boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+                    maxWidth: 280,
+                    transform: "rotate(3deg)",
+                  }}
+                >
+                  <Typography sx={{ fontSize: 14, fontWeight: 500, color: TEXT_DARK }}>
+                    {activeCard.title}
+                  </Typography>
+                </Box>
+              ) : null}
+            </DragOverlay>
+          </BoardDragOverlayPortal>
         </DndContext>
       )}
 
@@ -1395,7 +1960,12 @@ export function KanbanBoard({
           card={selectedCard}
           isFavorite={favoriteCardIds.includes(selectedCard.id)}
           onToggleFavorite={() => toggleFavorite(selectedCard.id)}
-          onCreateRelatedCard={() => onCreateCard?.(selectedCard.column_id)}
+          onCreateRelatedCard={() =>
+            onCreateCard?.(
+              selectedCard.column_id,
+              selectedCard.track_id ? { trackId: selectedCard.track_id } : undefined
+            )
+          }
           users={boardMembers}
           availableColumns={grid?.columns.map((c) => ({ id: c.id, name: c.name, is_done: c.is_done })) || []}
           onUpdateCard={async (patch) => {
@@ -1525,6 +2095,7 @@ export function KanbanBoard({
                 headers: {
                   Authorization: `Bearer ${token}`,
                   "Content-Type": "application/json",
+                  ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
                 },
                 body: JSON.stringify({ body }),
               });

@@ -29,6 +29,148 @@ from . import state
 router = APIRouter(prefix="/api/kanban", tags=["kanban"])
 
 MEDIA_ROOT = os.environ.get("MEDIA_ROOT", "/tmp/kaiten_media")
+DEFAULT_TRACK_NAME = "Основной поток"
+WORKFLOW_COLUMNS: list[tuple[str, bool]] = [
+    ("Задачи", False),
+    ("К выполнению", False),
+    ("В работе", False),
+    ("Проверка", False),
+    ("Размещение", False),
+    ("Выполнено", True),
+]
+WORKFLOW_COLUMN_NAMES = {name for name, _ in WORKFLOW_COLUMNS}
+DEFAULT_BACKLOG_COLUMN_NAME = WORKFLOW_COLUMNS[0][0]
+
+
+async def _ensure_kanban_extensions(conn: asyncpg.Connection) -> None:
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS core_cardassignment (
+            id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+            card_id uuid NOT NULL REFERENCES core_card(id) ON DELETE CASCADE,
+            user_id uuid NOT NULL REFERENCES core_user(id) ON DELETE CASCADE,
+            assigned_by_id uuid REFERENCES core_user(id) ON DELETE SET NULL,
+            assigned_at timestamptz NOT NULL DEFAULT now(),
+            UNIQUE(card_id, user_id)
+        )
+        """
+    )
+    await conn.execute("CREATE INDEX IF NOT EXISTS core_cardassignment_user_idx ON core_cardassignment(user_id)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS core_cardassignment_card_idx ON core_cardassignment(card_id)")
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS core_cardcommentreadstate (
+            id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+            card_id uuid NOT NULL REFERENCES core_card(id) ON DELETE CASCADE,
+            user_id uuid NOT NULL REFERENCES core_user(id) ON DELETE CASCADE,
+            last_seen_comment_at timestamptz NOT NULL DEFAULT to_timestamp(0),
+            updated_at timestamptz NOT NULL DEFAULT now(),
+            UNIQUE(card_id, user_id)
+        )
+        """
+    )
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS core_commentattachmentlink (
+            id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+            comment_id uuid NOT NULL REFERENCES core_cardcomment(id) ON DELETE CASCADE,
+            attachment_id uuid NOT NULL REFERENCES core_attachment(id) ON DELETE CASCADE,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            UNIQUE(comment_id, attachment_id)
+        )
+        """
+    )
+
+
+async def _ensure_board_workflow(conn: asyncpg.Connection, board_id: str) -> None:
+    # Сериализуем операции по одной доске, чтобы не ловить race-condition
+    # на уникальном индексе (board_id, order_index).
+    await conn.execute("SELECT id FROM core_board WHERE id = $1::uuid FOR UPDATE", board_id)
+    existing = await conn.fetch(
+        "SELECT id, name FROM core_column WHERE board_id = $1::uuid ORDER BY order_index, created_at, id FOR UPDATE",
+        board_id,
+    )
+    by_name = {str(r["name"]): str(r["id"]) for r in existing}
+    now = datetime.now(timezone.utc)
+
+    for idx, (column_name, is_done) in enumerate(WORKFLOW_COLUMNS, start=1):
+        col_id = by_name.get(column_name)
+        if not col_id:
+            col_id = str(uuid.uuid4())
+            # Ставим во временную область order_index, чтобы не конфликтовать с существующими.
+            await conn.execute(
+                """
+                INSERT INTO core_column (id, board_id, name, order_index, is_done, created_at)
+                VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6)
+                """,
+                col_id,
+                board_id,
+                column_name,
+                1000 + idx,
+                is_done,
+                now,
+            )
+        by_name[column_name] = col_id
+
+    required_ids = [by_name[name] for name, _ in WORKFLOW_COLUMNS]
+    for idx, col_id in enumerate(required_ids, start=1):
+        await conn.execute(
+            "UPDATE core_column SET order_index = $1, is_done = $2 WHERE id = $3::uuid",
+            2000 + idx,
+            WORKFLOW_COLUMNS[idx - 1][1],
+            col_id,
+        )
+
+    stale_rows = [r for r in existing if str(r["name"]) not in WORKFLOW_COLUMN_NAMES]
+    for idx, stale in enumerate(stale_rows, start=1):
+        await conn.execute(
+            "UPDATE core_column SET order_index = $1 WHERE id = $2::uuid",
+            3000 + idx,
+            str(stale["id"]),
+        )
+
+    for idx, col_id in enumerate(required_ids, start=1):
+        await conn.execute(
+            "UPDATE core_column SET order_index = $1, is_done = $2 WHERE id = $3::uuid",
+            idx,
+            WORKFLOW_COLUMNS[idx - 1][1],
+            col_id,
+        )
+
+    track_exists = await conn.fetchrow("SELECT id FROM core_track WHERE board_id = $1::uuid LIMIT 1", board_id)
+    if not track_exists:
+        await conn.execute(
+            """
+            INSERT INTO core_track (id, board_id, name, order_index, created_at)
+            VALUES ($1::uuid, $2::uuid, $3, 1, $4)
+            """,
+            str(uuid.uuid4()),
+            board_id,
+            DEFAULT_TRACK_NAME,
+            now,
+        )
+
+
+async def _can_executor_work_with_card(conn: asyncpg.Connection, user_id: str, card_id: str) -> bool:
+    assigned = await conn.fetchrow(
+        "SELECT 1 FROM core_cardassignment WHERE card_id = $1::uuid AND user_id = $2::uuid LIMIT 1",
+        card_id,
+        user_id,
+    )
+    if assigned:
+        return True
+    assignee = await conn.fetchrow(
+        """
+        SELECT 1
+        FROM core_cardfieldvalue fv
+        JOIN core_cardfielddefinition fd ON fd.id = fv.definition_id
+        WHERE fv.card_id = $1::uuid AND fd.key = 'assignee_user_id' AND fv.value::text = to_jsonb($2::text)::text
+        LIMIT 1
+        """,
+        card_id,
+        user_id,
+    )
+    return bool(assignee)
 
 
 async def _require_lead_for_space_org(space_id: str, user_id: str) -> tuple[str, str]:
@@ -56,6 +198,36 @@ async def _require_lead_for_space_org(space_id: str, user_id: str) -> tuple[str,
     if ROLE_PRIORITY.get(role, 0) < ROLE_PRIORITY["lead"]:
         raise HTTPException(status_code=403, detail="insufficient_role")
     return str(row["id"]), org_id
+
+
+async def _require_manager_for_board(board_id: str, user_id: str) -> tuple[str, str]:
+    """
+    Доступ к операции с доской: членство в org доски + роль manager+ (без зависимости от X-Space-Id).
+    """
+    if not state.pg_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    async with state.pg_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT b.id, s.organization_id
+            FROM core_board b
+            JOIN core_space s ON s.id = b.space_id
+            JOIN core_organizationmember om ON om.organization_id = s.organization_id AND om.user_id = $2::uuid
+            WHERE b.id = $1::uuid
+            LIMIT 1
+            """,
+            board_id,
+            user_id,
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="Доска не найдена или нет доступа")
+    org_id = str(row["organization_id"])
+    role = await get_effective_role(user_id, org_id)
+    if ROLE_PRIORITY.get(role, 0) < ROLE_PRIORITY["manager"]:
+        raise HTTPException(status_code=403, detail="insufficient_role")
+    return str(row["id"]), org_id
+
+
 MEDIA_URL = os.environ.get("MEDIA_URL", "/media/")
 
 
@@ -156,6 +328,51 @@ async def _purge_space_before_delete(conn: asyncpg.Connection, space_id: str) ->
         pass
 
 
+async def _purge_board_before_delete(conn: asyncpg.Connection, board_id: str) -> None:
+    cards_sql = "SELECT id FROM core_card WHERE board_id = $1::uuid"
+    await conn.execute(
+        f"UPDATE core_card SET parent_id = NULL WHERE parent_id IN ({cards_sql})",
+        board_id,
+    )
+    await conn.execute(
+        f"""DELETE FROM core_checklistitem WHERE checklist_id IN (
+            SELECT id FROM core_checklist WHERE card_id IN ({cards_sql}))""",
+        board_id,
+    )
+    await conn.execute(f"DELETE FROM core_checklist WHERE card_id IN ({cards_sql})", board_id)
+    await conn.execute(f"DELETE FROM core_attachment WHERE card_id IN ({cards_sql})", board_id)
+    await conn.execute(f"DELETE FROM core_cardfieldvalue WHERE card_id IN ({cards_sql})", board_id)
+    await conn.execute(f"DELETE FROM core_cardcomment WHERE card_id IN ({cards_sql})", board_id)
+    await conn.execute(f"DELETE FROM core_cardmovementevent WHERE card_id IN ({cards_sql})", board_id)
+    for sql in (
+        f"DELETE FROM core_cardtag WHERE card_id IN ({cards_sql})",
+        f"DELETE FROM core_document WHERE card_id IN ({cards_sql})",
+        f"DELETE FROM core_cardrelation WHERE from_card_id IN ({cards_sql}) OR to_card_id IN ({cards_sql})",
+        f"DELETE FROM core_cardblock WHERE card_id IN ({cards_sql})",
+        f"DELETE FROM core_timeentry WHERE card_id IN ({cards_sql})",
+    ):
+        try:
+            await conn.execute(sql, board_id)
+        except asyncpg.exceptions.UndefinedTableError:
+            pass
+
+    await conn.execute("DELETE FROM core_card WHERE board_id = $1::uuid", board_id)
+    for sql in (
+        "DELETE FROM core_sprintcapacity WHERE sprint_id IN (SELECT id FROM core_sprint WHERE board_id = $1::uuid)",
+        "DELETE FROM core_sprint WHERE board_id = $1::uuid",
+        "DELETE FROM core_automationexecution WHERE rule_id IN (SELECT id FROM core_automationrule WHERE board_id = $1::uuid)",
+        "DELETE FROM core_automationrule WHERE board_id = $1::uuid",
+        "DELETE FROM core_restrictionrule WHERE board_id = $1::uuid",
+        "DELETE FROM core_wiplimit WHERE board_id = $1::uuid",
+    ):
+        try:
+            await conn.execute(sql, board_id)
+        except asyncpg.exceptions.UndefinedTableError:
+            pass
+    await conn.execute("DELETE FROM core_column WHERE board_id = $1::uuid", board_id)
+    await conn.execute("DELETE FROM core_track WHERE board_id = $1::uuid", board_id)
+
+
 def _coerce_priority_display(value: Any) -> str | None:
     """Убирает лишние кавычки из jsonb/строк (чтобы не показывать \"Срочно\")."""
     if value is None:
@@ -231,6 +448,9 @@ def _card_lite(row: Any, meta: dict[str, Any] | None = None) -> dict[str, Any]:
         "assignee_user_id": meta.get("assignee_user_id"),
         "blocked_count": int(meta.get("blocked_count") or 0),
         "blocking_count": int(meta.get("blocking_count") or 0),
+        "comments_count": int(meta.get("comments_count") or 0),
+        "unread_comments_count": int(meta.get("unread_comments_count") or 0),
+        "attachments_count": int(meta.get("attachments_count") or 0),
     }
 
 
@@ -349,6 +569,7 @@ async def create_project(
         raise HTTPException(status_code=400, detail="space_id required")
 
     async with state.pg_pool.acquire() as conn:
+        await _ensure_kanban_extensions(conn)
         access = await conn.fetchrow(
             """
             SELECT 1
@@ -378,7 +599,6 @@ async def create_project(
 async def create_board(
     request: Request,
     user_id: str = Depends(require_authenticated_user_id),
-    _: None = Depends(require_space_access),
     _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
     """Создать доску в доступном пользователю пространстве."""
@@ -449,26 +669,44 @@ async def create_board(
             now,
         )
 
-        default_columns = [
-            ("ToDo", 1, False),
-            ("In Progress", 2, False),
-            ("Done", 3, True),
-        ]
-        for col_name, order_index, is_done in default_columns:
-            await conn.execute(
-                """
-                INSERT INTO core_column (id, board_id, name, order_index, is_done, created_at)
-                VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6)
-                """,
-                str(uuid.uuid4()),
-                board_id,
-                col_name,
-                order_index,
-                is_done,
-                now,
-            )
+        await _ensure_board_workflow(conn, board_id)
 
     return {"id": board_id, "name": name, "space_id": str(space_id)}
+
+
+@router.patch("/boards/{board_id}")
+async def rename_board(
+    request: Request,
+    board_id: str,
+    user_id: str = Depends(require_authenticated_user_id),
+) -> dict[str, Any]:
+    """Переименовать доску."""
+    await _require_manager_for_board(board_id, user_id)
+    if not state.pg_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    async with state.pg_pool.acquire() as conn:
+        await conn.execute("UPDATE core_board SET name = $1 WHERE id = $2::uuid", name, board_id)
+    return {"id": board_id, "name": name}
+
+
+@router.delete("/boards/{board_id}")
+async def delete_board(
+    board_id: str,
+    user_id: str = Depends(require_authenticated_user_id),
+) -> dict[str, Any]:
+    """Удалить доску и все её данные."""
+    await _require_manager_for_board(board_id, user_id)
+    if not state.pg_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    async with state.pg_pool.acquire() as conn:
+        async with conn.transaction():
+            await _purge_board_before_delete(conn, board_id)
+            await conn.execute("DELETE FROM core_board WHERE id = $1::uuid", board_id)
+    return {"ok": True, "board_id": board_id}
 
 
 @router.post("/boards/{board_id}/columns")
@@ -526,6 +764,132 @@ async def create_column(
             now,
         )
     return {"id": column_id, "board_id": board_id, "name": name, "is_done": is_done}
+
+
+@router.post("/boards/{board_id}/tracks")
+async def create_track(
+    request: Request,
+    board_id: str,
+    user_id: str = Depends(require_authenticated_user_id),
+    _: None = Depends(require_space_access),
+    _role: str = Depends(require_manager_role),
+) -> dict[str, Any]:
+    """Добавить дорожку (строку) на доску."""
+    if not state.pg_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    async with state.pg_pool.acquire() as conn:
+        await _ensure_kanban_extensions(conn)
+        board = await conn.fetchrow(
+            """
+            SELECT b.id, b.space_id
+            FROM core_board b
+            JOIN core_space s ON s.id = b.space_id
+            JOIN core_organizationmember om ON om.organization_id = s.organization_id
+            WHERE b.id = $1::uuid AND om.user_id = $2::uuid
+            LIMIT 1
+            """,
+            board_id,
+            user_id,
+        )
+        if not board:
+            board_exists = await conn.fetchrow("SELECT id FROM core_board WHERE id = $1::uuid", board_id)
+            if board_exists:
+                raise HTTPException(status_code=403, detail="board_forbidden")
+            raise HTTPException(status_code=404, detail="Доска не найдена")
+        max_order = await conn.fetchval(
+            "SELECT COALESCE(MAX(order_index), 0) FROM core_track WHERE board_id = $1::uuid",
+            board_id,
+        )
+        track_id = str(uuid.uuid4())
+        await conn.execute(
+            """
+            INSERT INTO core_track (id, board_id, name, order_index, created_at)
+            VALUES ($1::uuid, $2::uuid, $3, $4, $5)
+            """,
+            track_id,
+            board_id,
+            name,
+            int(max_order) + 1,
+            datetime.now(timezone.utc),
+        )
+    return {"id": track_id, "board_id": board_id, "name": name}
+
+
+@router.patch("/tracks/{track_id}")
+async def rename_track(
+    request: Request,
+    track_id: str,
+    user_id: str = Depends(require_authenticated_user_id),
+    _: None = Depends(require_space_access),
+    _role: str = Depends(require_manager_role),
+) -> dict[str, Any]:
+    if not state.pg_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    async with state.pg_pool.acquire() as conn:
+        track = await conn.fetchrow(
+            """
+            SELECT t.id, t.board_id, b.space_id
+            FROM core_track t
+            JOIN core_board b ON b.id = t.board_id
+            JOIN core_space s ON s.id = b.space_id
+            JOIN core_organizationmember om ON om.organization_id = s.organization_id
+            WHERE t.id = $1::uuid AND om.user_id = $2::uuid
+            LIMIT 1
+            """,
+            track_id,
+            user_id,
+        )
+        if not track:
+            raise HTTPException(status_code=404, detail="Дорожка не найдена")
+        active_space_id = request.headers.get("x-space-id")
+        if active_space_id and str(track["space_id"]) != active_space_id:
+            raise HTTPException(status_code=403, detail="space_forbidden")
+        await conn.execute("UPDATE core_track SET name = $1 WHERE id = $2::uuid", name, track_id)
+    return {"ok": True, "id": track_id, "name": name}
+
+
+@router.delete("/tracks/{track_id}")
+async def delete_track(
+    request: Request,
+    track_id: str,
+    user_id: str = Depends(require_authenticated_user_id),
+    _: None = Depends(require_space_access),
+    _role: str = Depends(require_manager_role),
+) -> dict[str, Any]:
+    if not state.pg_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    async with state.pg_pool.acquire() as conn:
+        track = await conn.fetchrow(
+            """
+            SELECT t.id, t.board_id, b.space_id
+            FROM core_track t
+            JOIN core_board b ON b.id = t.board_id
+            JOIN core_space s ON s.id = b.space_id
+            JOIN core_organizationmember om ON om.organization_id = s.organization_id
+            WHERE t.id = $1::uuid AND om.user_id = $2::uuid
+            LIMIT 1
+            """,
+            track_id,
+            user_id,
+        )
+        if not track:
+            raise HTTPException(status_code=404, detail="Дорожка не найдена")
+        active_space_id = request.headers.get("x-space-id")
+        if active_space_id and str(track["space_id"]) != active_space_id:
+            raise HTTPException(status_code=403, detail="space_forbidden")
+        cards_in_track = await conn.fetchval("SELECT COUNT(*)::int FROM core_card WHERE track_id = $1::uuid", track_id)
+        if int(cards_in_track or 0) > 0:
+            await conn.execute("UPDATE core_card SET track_id = NULL WHERE track_id = $1::uuid", track_id)
+        await conn.execute("DELETE FROM core_track WHERE id = $1::uuid", track_id)
+    return {"ok": True, "id": track_id}
 
 
 @router.patch("/columns/{column_id}")
@@ -861,6 +1225,7 @@ async def board_grid(
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     async with state.pg_pool.acquire() as conn:
+        await _ensure_kanban_extensions(conn)
         board = await conn.fetchrow(
             "SELECT id, name FROM core_board WHERE id = $1::uuid", board_id
         )
@@ -869,6 +1234,12 @@ async def board_grid(
         space_id = request.headers.get("x-space-id")
         if space_id and not await _check_board_space_access(conn, board_id, user_id, space_id):
             raise HTTPException(status_code=403, detail="space_forbidden")
+        await _ensure_board_workflow(conn, board_id)
+        org_id = await conn.fetchval(
+            "SELECT s.organization_id FROM core_board b JOIN core_space s ON s.id = b.space_id WHERE b.id = $1::uuid",
+            board_id,
+        )
+        effective_role = await get_effective_role(user_id, str(org_id))
 
         columns = await conn.fetch(
             """
@@ -930,6 +1301,35 @@ async def board_grid(
                     except Exception:
                         meta["blocking_count"] = 0
 
+            comments_stat = await conn.fetch(
+                """
+                SELECT c.id AS card_id,
+                       COUNT(cc.id)::int AS comments_count,
+                       COUNT(*) FILTER (WHERE cc.created_at > COALESCE(rs.last_seen_comment_at, to_timestamp(0)))::int AS unread_comments_count
+                FROM core_card c
+                LEFT JOIN core_cardcomment cc ON cc.card_id = c.id
+                LEFT JOIN core_cardcommentreadstate rs ON rs.card_id = c.id AND rs.user_id = $2::uuid
+                WHERE c.id = ANY($1::uuid[])
+                GROUP BY c.id, rs.last_seen_comment_at
+                """,
+                card_ids,
+                user_id,
+            )
+            for row in comments_stat:
+                cid = str(row["card_id"])
+                meta = card_meta.setdefault(cid, {})
+                meta["comments_count"] = int(row["comments_count"] or 0)
+                meta["unread_comments_count"] = int(row["unread_comments_count"] or 0)
+
+            attachments_stat = await conn.fetch(
+                "SELECT card_id, COUNT(*)::int AS attachments_count FROM core_attachment WHERE card_id = ANY($1::uuid[]) GROUP BY card_id",
+                card_ids,
+            )
+            for row in attachments_stat:
+                cid = str(row["card_id"])
+                meta = card_meta.setdefault(cid, {})
+                meta["attachments_count"] = int(row["attachments_count"] or 0)
+
     by_col = {str(c["id"]): [] for c in columns}
     for card in cards:
         cid = str(card["id"])
@@ -937,6 +1337,7 @@ async def board_grid(
 
     return {
         "board": {"id": str(board["id"]), "name": board["name"]},
+        "effective_role": effective_role,
         "tracks": [{"id": str(t["id"]), "name": t["name"]} for t in tracks],
         "columns": [
             {
@@ -993,6 +1394,7 @@ async def card_move(
         raise HTTPException(status_code=400, detail="to_column_id required")
 
     async with state.pg_pool.acquire() as conn:
+        await _ensure_kanban_extensions(conn)
         card = await conn.fetchrow(
             "SELECT id, board_id, column_id, track_id FROM core_card WHERE id = $1::uuid",
             card_id,
@@ -1010,6 +1412,8 @@ async def card_move(
         )
         if not space:
             raise HTTPException(status_code=404, detail="Доска не найдена")
+        await get_effective_role(user_id, str(space["organization_id"]))
+        # Исполнитель: может переносить карточки по колонкам доски (смена статуса в workflow), без проверки назначения.
         space_id_h = request.headers.get("x-space-id")
         if space_id_h and str(space["space_id"]) != space_id_h:
             raise HTTPException(status_code=403, detail="Карточка вне активного space")
@@ -1152,6 +1556,7 @@ async def card_detail(
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     async with state.pg_pool.acquire() as conn:
+        await _ensure_kanban_extensions(conn)
         card = await conn.fetchrow(
             "SELECT c.id, b.space_id FROM core_card c JOIN core_board b ON b.id = c.board_id WHERE c.id = $1::uuid",
             card_id,
@@ -1162,6 +1567,18 @@ async def card_detail(
         if space_id and str(card["space_id"]) != space_id:
             raise HTTPException(status_code=403, detail="Карточка вне активного space")
         out = await _card_detail_dict(conn, card_id)
+        unread_count = await conn.fetchval(
+            """
+            SELECT COUNT(*)::int
+            FROM core_cardcomment cc
+            LEFT JOIN core_cardcommentreadstate rs ON rs.card_id = cc.card_id AND rs.user_id = $2::uuid
+            WHERE cc.card_id = $1::uuid AND cc.created_at > COALESCE(rs.last_seen_comment_at, to_timestamp(0))
+            """,
+            card_id,
+            user_id,
+        )
+        if out is not None:
+            out["unread_comments_count"] = int(unread_count or 0)
     if not out:
         raise HTTPException(status_code=404, detail="Карточка не найдена")
     return out
@@ -1182,6 +1599,7 @@ async def create_checklist(
     if not title:
         raise HTTPException(status_code=400, detail="title required")
     async with state.pg_pool.acquire() as conn:
+        await _ensure_kanban_extensions(conn)
         card = await conn.fetchrow(
             "SELECT c.id, c.board_id, b.space_id FROM core_card c JOIN core_board b ON b.id = c.board_id WHERE c.id = $1::uuid",
             card_id,
@@ -1316,6 +1734,11 @@ async def card_comments(
         space_id = request.headers.get("x-space-id")
         if space_id and str(card["space_id"]) != space_id:
             raise HTTPException(status_code=403, detail="Карточка вне активного space")
+        role = await get_effective_role(user_id, str(card["organization_id"]))
+        if role == "executor":
+            allowed = await _can_executor_work_with_card(conn, user_id, card_id)
+            if not allowed:
+                raise HTTPException(status_code=403, detail="executor_card_forbidden")
 
         comment_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
@@ -1327,6 +1750,35 @@ async def card_comments(
             card_id,
             user_id,
             comment_body,
+            now,
+        )
+        attachment_ids = body.get("attachment_ids") if isinstance(body.get("attachment_ids"), list) else []
+        for att_id in attachment_ids:
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO core_commentattachmentlink (id, comment_id, attachment_id, created_at)
+                    VALUES ($1::uuid, $2::uuid, $3::uuid, $4)
+                    ON CONFLICT (comment_id, attachment_id) DO NOTHING
+                    """,
+                    str(uuid.uuid4()),
+                    comment_id,
+                    str(att_id),
+                    now,
+                )
+            except Exception:
+                continue
+
+        await conn.execute(
+            """
+            INSERT INTO core_cardcommentreadstate (id, card_id, user_id, last_seen_comment_at, updated_at)
+            VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $4)
+            ON CONFLICT (card_id, user_id)
+            DO UPDATE SET last_seen_comment_at = EXCLUDED.last_seen_comment_at, updated_at = EXCLUDED.updated_at
+            """,
+            str(uuid.uuid4()),
+            card_id,
+            user_id,
             now,
         )
         await ensure_notifications_table(conn=conn)
@@ -1352,6 +1804,47 @@ async def card_comments(
     ]
 
 
+@router.post("/cards/{card_id}/comments/mark-read")
+async def mark_card_comments_read(
+    request: Request,
+    card_id: str,
+    user_id: str = Depends(require_authenticated_user_id),
+    _: None = Depends(require_space_access),
+) -> dict[str, Any]:
+    if not state.pg_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    async with state.pg_pool.acquire() as conn:
+        await _ensure_kanban_extensions(conn)
+        card = await conn.fetchrow(
+            """
+            SELECT c.id, b.space_id
+            FROM core_card c
+            JOIN core_board b ON b.id = c.board_id
+            WHERE c.id = $1::uuid
+            """,
+            card_id,
+        )
+        if not card:
+            raise HTTPException(status_code=404, detail="Карточка не найдена")
+        space_id = request.headers.get("x-space-id")
+        if space_id and str(card["space_id"]) != space_id:
+            raise HTTPException(status_code=403, detail="Карточка вне активного space")
+        now = datetime.now(timezone.utc)
+        await conn.execute(
+            """
+            INSERT INTO core_cardcommentreadstate (id, card_id, user_id, last_seen_comment_at, updated_at)
+            VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $4)
+            ON CONFLICT (card_id, user_id)
+            DO UPDATE SET last_seen_comment_at = EXCLUDED.last_seen_comment_at, updated_at = EXCLUDED.updated_at
+            """,
+            str(uuid.uuid4()),
+            card_id,
+            user_id,
+            now,
+        )
+    return {"ok": True, "card_id": card_id, "read_at": now.isoformat()}
+
+
 @router.post("/cards/{card_id}/attachments")
 async def card_attachments(
     request: Request,
@@ -1361,8 +1854,9 @@ async def card_attachments(
 ) -> dict[str, Any]:
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
-    content_type = request.headers.get("content-type") or ""
-    is_multipart = "multipart/form-data" in content_type
+    request_content_type = request.headers.get("content-type") or ""
+    is_multipart = "multipart/form-data" in request_content_type
+    link_payload: dict[str, Any] = {}
 
     async with state.pg_pool.acquire() as conn:
         card = await conn.fetchrow(
@@ -1380,6 +1874,11 @@ async def card_attachments(
         space_id = request.headers.get("x-space-id")
         if space_id and str(card["space_id"]) != space_id:
             raise HTTPException(status_code=403, detail="Карточка вне активного space")
+        role = await get_effective_role(user_id, str(card["organization_id"]))
+        if role == "executor":
+            allowed = await _can_executor_work_with_card(conn, user_id, card_id)
+            if not allowed:
+                raise HTTPException(status_code=403, detail="executor_card_forbidden")
         org_id = str(card["organization_id"])
 
     if is_multipart:
@@ -1402,13 +1901,14 @@ async def card_attachments(
         content_type = upload.content_type or ""
         size_bytes = len(content)
     else:
-        body = await request.json() if content_type.startswith("application/json") else {}
-        file_url = body.get("file_url")
+        link_payload = await request.json() if request_content_type.startswith("application/json") else {}
+        file_url = link_payload.get("file_url")
         if not file_url:
             raise HTTPException(status_code=400, detail="Для добавления по ссылке передайте file_url")
-        file_name = (body.get("file_name") or Path(urlparse(file_url).path).name or "link").strip()[:255]
-        content_type = body.get("content_type") or ""
+        file_name = (link_payload.get("file_name") or Path(urlparse(file_url).path).name or "link").strip()[:255]
+        content_type = link_payload.get("content_type") or ""
         size_bytes = None
+    is_preview = (content_type or "").startswith("image/")
 
     async with state.pg_pool.acquire() as conn:
         att_id = str(uuid.uuid4())
@@ -1425,9 +1925,26 @@ async def card_attachments(
             size_bytes,
             now,
         )
+        comment_id = None
+        if not is_multipart:
+            comment_id = link_payload.get("comment_id")
+        if comment_id:
+            await conn.execute(
+                """
+                INSERT INTO core_commentattachmentlink (id, comment_id, attachment_id, created_at)
+                VALUES ($1::uuid, $2::uuid, $3::uuid, $4)
+                ON CONFLICT (comment_id, attachment_id) DO NOTHING
+                """,
+                str(uuid.uuid4()),
+                str(comment_id),
+                att_id,
+                now,
+            )
         detail = await _card_detail_dict(conn, card_id)
     if not detail:
         raise HTTPException(status_code=404, detail="Карточка не найдена")
+    if detail:
+        detail["last_attachment"] = {"id": att_id, "is_preview": is_preview}
     return detail
 
 
@@ -1459,6 +1976,15 @@ async def update_card(
         )
         if not card:
             raise HTTPException(status_code=404, detail="Карточка не найдена")
+        org_id = await conn.fetchval(
+            "SELECT s.organization_id FROM core_board b JOIN core_space s ON s.id = b.space_id WHERE b.id = $1::uuid",
+            str(card["board_id"]),
+        )
+        role = await get_effective_role(user_id, str(org_id))
+        if role == "executor":
+            allowed = await _can_executor_work_with_card(conn, user_id, card_id)
+            if not allowed:
+                raise HTTPException(status_code=403, detail="executor_card_forbidden")
         active_space_id = request.headers.get("x-space-id")
         if active_space_id and str(card["space_id"]) != active_space_id:
             raise HTTPException(status_code=403, detail="Карточка вне активного space")
@@ -1484,6 +2010,10 @@ async def update_card(
             )
             if not col:
                 raise HTTPException(status_code=400, detail="column_not_found_or_outside_board")
+            if role == "executor":
+                col_name = await conn.fetchval("SELECT name FROM core_column WHERE id = $1::uuid", str(next_column_id))
+                if (col_name or "").strip() == DEFAULT_BACKLOG_COLUMN_NAME:
+                    raise HTTPException(status_code=403, detail="executor_cannot_move_to_backlog")
             patch["column_id"] = str(col["id"])
 
         def _parse_iso(value: Any) -> datetime | None:
@@ -1671,7 +2201,7 @@ async def create_card(
     request: Request,
     user_id: str = Depends(require_authenticated_user_id),
     _: None = Depends(require_space_access),
-    _role: str = Depends(require_manager_role),
+    _role: str = Depends(require_lead_role),
 ) -> dict[str, Any]:
     """Создать новую карточку."""
     if not state.pg_pool:
@@ -1681,6 +2211,7 @@ async def create_card(
     description = (body.get("description") or "").strip()
     column_id = body.get("column_id")
     board_id = body.get("board_id")
+    track_id_raw = body.get("track_id")
     due_at = body.get("due_at")
     planned_start_at = body.get("planned_start_at")
     planned_end_at = body.get("planned_end_at")
@@ -1697,6 +2228,19 @@ async def create_card(
                 board_id = str(col_row["board_id"])
         if not board_id:
             raise HTTPException(status_code=400, detail="board_id required or column not found")
+
+        track_uuid: str | None = None
+        if track_id_raw:
+            tid = str(track_id_raw).strip()
+            if tid:
+                tr = await conn.fetchrow(
+                    "SELECT id FROM core_track WHERE id = $1::uuid AND board_id = $2::uuid",
+                    tid,
+                    board_id,
+                )
+                if not tr:
+                    raise HTTPException(status_code=400, detail="invalid_track_id")
+                track_uuid = tid
 
         card_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
@@ -1728,12 +2272,13 @@ async def create_card(
 
         await conn.execute(
             """
-            INSERT INTO core_card (id, board_id, column_id, title, description, card_type, due_at, planned_start_at, planned_end_at, created_at, updated_at)
-            VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, 'task', $6, $7, $8, $9, $9)
+            INSERT INTO core_card (id, board_id, column_id, track_id, title, description, card_type, due_at, planned_start_at, planned_end_at, created_at, updated_at)
+            VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, 'task', $7, $8, $9, $10, $10)
             """,
             card_id,
             board_id,
             column_id,
+            track_uuid,
             title,
             description,
             due_at_val,
@@ -1759,6 +2304,58 @@ async def create_card(
 
         detail = await _card_detail_dict(conn, card_id)
     return detail or {"id": card_id, "title": title}
+
+
+@router.post("/cards/{card_id}/assignees")
+async def assign_card_executor(
+    request: Request,
+    card_id: str,
+    user_id: str = Depends(require_authenticated_user_id),
+    _: None = Depends(require_space_access),
+    _role: str = Depends(require_lead_role),
+) -> dict[str, Any]:
+    if not state.pg_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    assignee_user_id = body.get("user_id")
+    if not assignee_user_id:
+        raise HTTPException(status_code=400, detail="user_id required")
+    async with state.pg_pool.acquire() as conn:
+        await _ensure_kanban_extensions(conn)
+        card = await conn.fetchrow(
+            """
+            SELECT c.id, c.board_id, b.space_id, s.organization_id
+            FROM core_card c
+            JOIN core_board b ON b.id = c.board_id
+            JOIN core_space s ON s.id = b.space_id
+            WHERE c.id = $1::uuid
+            """,
+            card_id,
+        )
+        if not card:
+            raise HTTPException(status_code=404, detail="Карточка не найдена")
+        exists = await conn.fetchrow(
+            "SELECT 1 FROM core_organizationmember WHERE organization_id = $1::uuid AND user_id = $2::uuid LIMIT 1",
+            str(card["organization_id"]),
+            str(assignee_user_id),
+        )
+        if not exists:
+            raise HTTPException(status_code=400, detail="user_not_in_organization")
+        now = datetime.now(timezone.utc)
+        await conn.execute(
+            """
+            INSERT INTO core_cardassignment (id, card_id, user_id, assigned_by_id, assigned_at)
+            VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5)
+            ON CONFLICT (card_id, user_id) DO UPDATE
+            SET assigned_by_id = EXCLUDED.assigned_by_id, assigned_at = EXCLUDED.assigned_at
+            """,
+            str(uuid.uuid4()),
+            card_id,
+            str(assignee_user_id),
+            user_id,
+            now,
+        )
+    return {"ok": True, "card_id": card_id, "user_id": str(assignee_user_id)}
 
 
 @router.post("/spaces")
@@ -1845,6 +2442,17 @@ async def delete_space(
         raise HTTPException(status_code=503, detail="Database not available")
     async with state.pg_pool.acquire() as conn:
         async with conn.transaction():
+            spaces_count = await conn.fetchval(
+                "SELECT COUNT(*)::int FROM core_space WHERE organization_id = $1::uuid",
+                org_id,
+            )
+            if int(spaces_count or 0) <= 1:
+                # Для последнего пространства сначала удаляем его содержимое и сам space,
+                # затем уже организацию (иначе FK core_space -> core_organization блокирует COMMIT).
+                await _purge_space_before_delete(conn, space_id)
+                await conn.execute("DELETE FROM core_space WHERE id = $1::uuid", space_id)
+                await conn.execute("DELETE FROM core_organization WHERE id = $1::uuid", org_id)
+                return {"ok": True, "id": space_id, "deleted_organization": True}
             await _purge_space_before_delete(conn, space_id)
             await conn.execute("DELETE FROM core_space WHERE id = $1::uuid", space_id)
-    return {"ok": True, "id": space_id}
+    return {"ok": True, "id": space_id, "deleted_organization": False}

@@ -8,3 +8,10 @@ node_modules/
 .DS_Store
 __pycache__/
 *.pyc
+
+# Playwright / локальные артефакты
+frontend/test-results/
+**/tsconfig.tsbuildinfo
+
+# Загруженные аватары (не в репозиторий)
+backend/media/avatars/

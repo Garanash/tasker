@@ -28,7 +28,13 @@ const LAST_ACTIVE_SPACE_STORAGE_KEY = "kaiten_last_active_space_id";
 type Space = { id: string; name: string; organization_id: string };
 type Project = { id: string; name: string; space_id: string };
 type Board = { id: string; name: string; space_id?: string; project_id?: string };
-type OrgUser = { id: string; email: string; full_name: string; role: "user" | "manager" | "lead" | "admin" };
+type OrgUser = {
+  id: string;
+  email: string;
+  full_name: string;
+  role: "user" | "executor" | "manager" | "lead" | "admin";
+  last_login?: string | null;
+};
 type CurrentUserMe = {
   user: { id: string; email: string; full_name: string; avatar_url?: string };
   effective_role: AppRole | "";
@@ -319,11 +325,19 @@ export default function AppHomePageImplGray() {
   const [orgName, setOrgName] = useState("");
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [loginMethod, setLoginMethod] = useState<"password" | "code">("password");
+  const [otpCode, setOtpCode] = useState("");
+  const [adminEditUser, setAdminEditUser] = useState<OrgUser | null>(null);
+  const [adminEditFullName, setAdminEditFullName] = useState("");
+  const [adminEditEmail, setAdminEditEmail] = useState("");
+  const [adminEditBusy, setAdminEditBusy] = useState(false);
+  const [userCodeBusyId, setUserCodeBusyId] = useState<string | null>(null);
 
   const [createSpaceOpen, setCreateSpaceOpen] = useState(false);
   const [createFolderOpen, setCreateFolderOpen] = useState(false);
   const [createTaskOpen, setCreateTaskOpen] = useState(false);
   const [createTaskColumnId, setCreateTaskColumnId] = useState<string | null>(null);
+  const [createTaskTrackId, setCreateTaskTrackId] = useState<string | null>(null);
   const [uiLanguage, setUiLanguage] = useState<AppLanguage>("ru");
   const [uiTheme, setUiTheme] = useState<ColorTheme>("system");
   const [selectedCard, setSelectedCard] = useState<CardDetail | null>(null);
@@ -331,6 +345,7 @@ export default function AppHomePageImplGray() {
   const [orgUsers, setOrgUsers] = useState<OrgUser[]>([]);
   const [orgUsersLoading, setOrgUsersLoading] = useState(false);
   const [orgUsersError, setOrgUsersError] = useState<string | null>(null);
+  const [orgUsersSuccess, setOrgUsersSuccess] = useState<string | null>(null);
   const [newUserEmail, setNewUserEmail] = useState("");
   const [newUserPassword, setNewUserPassword] = useState("");
   const [newUserFullName, setNewUserFullName] = useState("");
@@ -346,7 +361,7 @@ export default function AppHomePageImplGray() {
   const [profileDialogOpen, setProfileDialogOpen] = useState(false);
 
   const access = token?.access;
-  const canManageBoard = effectiveRole !== "user";
+  const canManageBoard = effectiveRole !== "user" && effectiveRole !== "executor";
   const isAdmin = effectiveRole === "admin";
   const canManageCurrentSpace = useMemo(() => {
     if (!activeSpaceId) return false;
@@ -582,6 +597,7 @@ export default function AppHomePageImplGray() {
   async function fetchOrganizationUsers(nextAccess: string, spaceId: string) {
     setOrgUsersLoading(true);
     setOrgUsersError(null);
+    setOrgUsersSuccess(null);
     try {
       const res = await fetch(getApiUrl("/api/auth/users"), {
         headers: { Authorization: `Bearer ${nextAccess}`, "X-Space-Id": spaceId },
@@ -990,14 +1006,19 @@ export default function AppHomePageImplGray() {
     setAuthLoading(true);
     setAuthError(null);
     try {
-      const url = getApiUrl(`/api/auth/${mode === "register" ? "register" : "login"}`);
+      const isOtpLogin = mode === "login" && loginMethod === "code";
+      const url = getApiUrl(
+        mode === "register" ? "/api/auth/register" : isOtpLogin ? "/api/auth/login-otp" : "/api/auth/login",
+      );
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body:
           mode === "register"
             ? JSON.stringify({ email, password, organization_name: orgName, full_name: "" })
-            : JSON.stringify({ email, password }),
+            : isOtpLogin
+              ? JSON.stringify({ email, code: otpCode.replace(/\s/g, "") })
+              : JSON.stringify({ email, password }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.detail ?? "Ошибка авторизации");
@@ -1112,12 +1133,80 @@ export default function AppHomePageImplGray() {
     }
   };
 
-  const handleCreateCardInColumn = (columnId: string) => {
+  const handleRenameBoard = async (boardId: string, newName: string): Promise<boolean> => {
+    if (!token) return false;
+    try {
+      const res = await fetch(getApiUrl(`/api/kanban/boards/${boardId}`), {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${token.access}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ name: newName }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const msg =
+          typeof data.detail === "string"
+            ? data.detail
+            : uiLanguage === "en"
+              ? "Could not rename board"
+              : "Не удалось переименовать доску";
+        setAuthError(msg);
+        return false;
+      }
+      setBoards((prev) => prev.map((b) => (b.id === boardId ? { ...b, name: newName } : b)));
+      if (activeBoardId === boardId && boardGrid) {
+        setBoardGrid((prev) => (prev ? { ...prev, board: { ...prev.board, name: newName } } : prev));
+      }
+      return true;
+    } catch {
+      setAuthError(uiLanguage === "en" ? "Could not rename board" : "Не удалось переименовать доску");
+      return false;
+    }
+  };
+
+  const handleDeleteBoard = async (boardId: string): Promise<boolean> => {
+    if (!token) return false;
+    try {
+      const res = await fetch(getApiUrl(`/api/kanban/boards/${boardId}`), {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token.access}` },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const msg =
+          typeof data.detail === "string"
+            ? data.detail
+            : uiLanguage === "en"
+              ? "Could not delete board"
+              : "Не удалось удалить доску";
+        setAuthError(msg);
+        return false;
+      }
+      if (activeSpaceId) {
+        await fetchBoardsForSpace(token.access, activeSpaceId);
+      } else {
+        setBoards((prev) => prev.filter((b) => b.id !== boardId));
+      }
+      if (activeBoardId === boardId) {
+        setActiveBoardId(null);
+        setBoardGrid(null);
+      }
+      return true;
+    } catch {
+      setAuthError(uiLanguage === "en" ? "Network error while deleting board" : "Ошибка сети при удалении доски");
+      return false;
+    }
+  };
+
+  const handleCreateCardInColumn = (columnId: string, options?: { trackId?: string }) => {
     if (!canManageBoard) {
       setAuthError(uiLanguage === "en" ? "Only manager and above can create cards" : "Создавать карточки могут только менеджер и выше");
       return;
     }
     setCreateTaskColumnId(columnId);
+    setCreateTaskTrackId(options?.trackId ?? null);
     setCreateTaskOpen(true);
   };
 
@@ -1130,6 +1219,8 @@ export default function AppHomePageImplGray() {
       setAuthError("Сначала выберите доску, чтобы создать карточку.");
       return;
     }
+    setCreateTaskColumnId(null);
+    setCreateTaskTrackId(null);
     setCreateTaskOpen(true);
   };
 
@@ -1176,6 +1267,11 @@ export default function AppHomePageImplGray() {
     if (!token || !activeSpaceId) return;
     try {
       let accessToken = token.access;
+      const activeProjects = projects.filter((project) => project.space_id === activeSpaceId);
+      const projectIdForBoard =
+        activeProjectId && activeProjects.some((project) => project.id === activeProjectId)
+          ? activeProjectId
+          : activeProjects[0]?.id || null;
       const name =
         uiLanguage === "en"
           ? `Board ${boards.length + 1}`
@@ -1188,7 +1284,7 @@ export default function AppHomePageImplGray() {
             "Content-Type": "application/json",
             "X-Space-Id": activeSpaceId,
           },
-          body: JSON.stringify({ name, space_id: activeSpaceId, project_id: activeProjectId || projects[0]?.id || null }),
+          body: JSON.stringify({ name, space_id: activeSpaceId, project_id: projectIdForBoard }),
         });
       let res = await createBoardRequest(accessToken);
       let data: any = await res.json().catch(() => ({}));
@@ -1265,13 +1361,36 @@ export default function AppHomePageImplGray() {
           <div className="mt-2 text-sm" style={{ color: uiColors.textMuted }}>Простая регистрация и авторизация</div>
 
           <div className="mt-5 flex gap-2">
-            <GreyButton variant={mode === "register" ? "primary" : "soft"} onClick={() => setMode("register")}>
+            <GreyButton
+              variant={mode === "register" ? "primary" : "soft"}
+              onClick={() => {
+                setMode("register");
+                setLoginMethod("password");
+              }}
+            >
               Регистрация
             </GreyButton>
-            <GreyButton variant={mode === "login" ? "primary" : "soft"} onClick={() => setMode("login")}>
+            <GreyButton
+              variant={mode === "login" ? "primary" : "soft"}
+              onClick={() => {
+                setMode("login");
+                setLoginMethod("password");
+              }}
+            >
               Вход
             </GreyButton>
           </div>
+
+          {mode === "login" ? (
+            <div className="mt-4 flex flex-wrap gap-2">
+              <GreyButton variant={loginMethod === "password" ? "primary" : "soft"} onClick={() => setLoginMethod("password")}>
+                Пароль
+              </GreyButton>
+              <GreyButton variant={loginMethod === "code" ? "primary" : "soft"} onClick={() => setLoginMethod("code")}>
+                Вход по коду
+              </GreyButton>
+            </div>
+          ) : null}
 
           <div className="mt-5 space-y-4">
             <label className="block">
@@ -1283,15 +1402,32 @@ export default function AppHomePageImplGray() {
                 className="w-full rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] text-[var(--k-text)] px-3 py-2 outline-none focus:border-[#8A2BE2]"
               />
             </label>
-            <label className="block">
-              <div className="text-[var(--k-text-muted)] text-sm mb-2">Пароль</div>
-              <input
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                type="password"
-                className="w-full rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] text-[var(--k-text)] px-3 py-2 outline-none focus:border-[#8A2BE2]"
-              />
-            </label>
+            {mode === "login" && loginMethod === "code" ? (
+              <label className="block">
+                <div className="text-[var(--k-text-muted)] text-sm mb-2">Код из письма (6 цифр)</div>
+                <input
+                  value={otpCode}
+                  onChange={(e) => setOtpCode(e.target.value)}
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  placeholder="000000"
+                  className="w-full rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] text-[var(--k-text)] px-3 py-2 outline-none focus:border-[#8A2BE2] tracking-widest text-lg"
+                />
+                <div className="text-[var(--k-text-muted)] text-xs mt-1.5">
+                  Запросите код в настройках профиля или попросите администратора.
+                </div>
+              </label>
+            ) : (
+              <label className="block">
+                <div className="text-[var(--k-text-muted)] text-sm mb-2">Пароль</div>
+                <input
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  type="password"
+                  className="w-full rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] text-[var(--k-text)] px-3 py-2 outline-none focus:border-[#8A2BE2]"
+                />
+              </label>
+            )}
             {mode === "register" ? (
               <label className="block">
                 <div className="text-[var(--k-text-muted)] text-sm mb-2">Организация</div>
@@ -1306,8 +1442,15 @@ export default function AppHomePageImplGray() {
 
             {authError ? <div className="text-red-500 text-sm">{authError}</div> : null}
 
-            <GreyButton onClick={() => submitAuth()} disabled={authLoading} variant="primary">
-              {authLoading ? "Подождите..." : authTitle}
+            <GreyButton
+              onClick={() => submitAuth()}
+              disabled={
+                authLoading ||
+                (mode === "login" && loginMethod === "code" && (otpCode.replace(/\s/g, "").length < 6 || !email.trim()))
+              }
+              variant="primary"
+            >
+              {authLoading ? "Подождите..." : mode === "login" && loginMethod === "code" ? "Войти по коду" : authTitle}
             </GreyButton>
           </div>
         </div>
@@ -1336,7 +1479,9 @@ export default function AppHomePageImplGray() {
         setActiveProjectId(projectId);
       }}
       onRenameSpace={handleRenameSpace}
+      onRenameBoard={handleRenameBoard}
       onDeleteSpace={handleDeleteSpace}
+      onDeleteBoard={handleDeleteBoard}
       activeTabId={kaitenTab}
       onTabChange={setKaitenTab}
       notificationCount={unreadNotificationsCount}
@@ -2312,6 +2457,7 @@ export default function AppHomePageImplGray() {
             </div>
             {orgUsersLoading ? <div className="text-[var(--k-text-muted)] text-sm">{uiLanguage === "en" ? "Loading users..." : "Загрузка пользователей..."}</div> : null}
             {orgUsersError ? <div className="text-red-500 text-sm mb-3">{orgUsersError}</div> : null}
+            {orgUsersSuccess ? <div className="text-emerald-600 dark:text-emerald-400 text-sm mb-3">{orgUsersSuccess}</div> : null}
 
             <div className="rounded-2xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] p-3 mb-4">
               <div className="font-semibold text-[var(--k-text)] mb-2">{uiLanguage === "en" ? "Create user" : "Создать пользователя"}</div>
@@ -2341,6 +2487,7 @@ export default function AppHomePageImplGray() {
                   className="rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] px-3 py-2 text-[var(--k-text)] outline-none"
                 >
                   <option value="user">{uiLanguage === "en" ? "User" : "Пользователь"}</option>
+                  <option value="executor">{uiLanguage === "en" ? "Executor" : "Исполнитель"}</option>
                   <option value="manager">{uiLanguage === "en" ? "Manager" : "Менеджер"}</option>
                   <option value="lead">{uiLanguage === "en" ? "Lead" : "Руководитель"}</option>
                   <option value="admin">{uiLanguage === "en" ? "Admin" : "Администратор"}</option>
@@ -2354,6 +2501,7 @@ export default function AppHomePageImplGray() {
                     if (!token || !activeSpaceId) return;
                     setNewUserBusy(true);
                     setOrgUsersError(null);
+                    setOrgUsersSuccess(null);
                     try {
                       const res = await fetch(getApiUrl("/api/auth/users"), {
                         method: "POST",
@@ -2398,40 +2546,114 @@ export default function AppHomePageImplGray() {
               <div className="font-semibold text-[var(--k-text)] mb-2">{uiLanguage === "en" ? "Users and roles" : "Пользователи и роли"}</div>
               <div className="space-y-2">
                 {orgUsers.map((u) => (
-                  <div key={u.id} className="rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] p-3 flex flex-col md:flex-row md:items-center gap-2">
-                    <div className="flex-1 min-w-0">
-                      <div className="text-[var(--k-text)] font-semibold truncate">{u.full_name || u.email}</div>
-                      <div className="text-[var(--k-text-muted)] text-sm truncate">{u.email}</div>
+                  <div
+                    key={u.id}
+                    className="rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] p-3 flex flex-col gap-3"
+                  >
+                    <div className="flex flex-col md:flex-row md:items-start gap-3">
+                      <div className="flex-1 min-w-0">
+                        <div className="text-[var(--k-text)] font-semibold truncate">{u.full_name || u.email}</div>
+                        <div className="text-[var(--k-text-muted)] text-sm truncate">{u.email}</div>
+                        <div className="text-[var(--k-text-muted)] text-xs mt-1">
+                          {u.last_login
+                            ? (uiLanguage === "en" ? "Last sign-in: " : "Последний вход: ") +
+                              new Date(u.last_login).toLocaleString(uiLanguage === "en" ? "en-US" : "ru-RU")
+                            : uiLanguage === "en"
+                              ? "No sign-in recorded yet"
+                              : "Входов по паролю/коду ещё не было"}
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <GreyButton
+                          variant="soft"
+                          onClick={() => {
+                            setAdminEditUser(u);
+                            setAdminEditFullName(u.full_name || "");
+                            setAdminEditEmail(u.email);
+                            setOrgUsersError(null);
+                            setOrgUsersSuccess(null);
+                          }}
+                        >
+                          {uiLanguage === "en" ? "Edit" : "Редактировать"}
+                        </GreyButton>
+                        <GreyButton
+                          variant="soft"
+                          disabled={userCodeBusyId === u.id}
+                          onClick={async () => {
+                            if (!token || !activeSpaceId) return;
+                            setUserCodeBusyId(u.id);
+                            setOrgUsersError(null);
+                            setOrgUsersSuccess(null);
+                            try {
+                              const res = await fetch(getApiUrl(`/api/auth/users/${u.id}/request-login-code`), {
+                                method: "POST",
+                                headers: {
+                                  Authorization: `Bearer ${token.access}`,
+                                  "X-Space-Id": activeSpaceId,
+                                },
+                              });
+                              const data = await res.json().catch(() => ({}));
+                              if (!res.ok) {
+                                throw new Error(
+                                  typeof data?.detail === "string"
+                                    ? data.detail
+                                    : uiLanguage === "en"
+                                      ? "Could not send code"
+                                      : "Не удалось отправить код",
+                                );
+                              }
+                              setOrgUsersSuccess(
+                                uiLanguage === "en"
+                                  ? `Login code sent to ${u.email}`
+                                  : `Код входа отправлен на ${u.email}`,
+                              );
+                            } catch (e: any) {
+                              setOrgUsersError(e?.message ?? "Ошибка отправки кода");
+                            } finally {
+                              setUserCodeBusyId(null);
+                            }
+                          }}
+                        >
+                          {userCodeBusyId === u.id
+                            ? uiLanguage === "en"
+                              ? "Sending…"
+                              : "Отправка…"
+                            : uiLanguage === "en"
+                              ? "Send login code"
+                              : "Код на почту"}
+                        </GreyButton>
+                        <select
+                          value={u.role}
+                          onChange={async (e) => {
+                            if (!token || !activeSpaceId) return;
+                            const nextRole = e.target.value as OrgUser["role"];
+                            try {
+                              const res = await fetch(getApiUrl(`/api/auth/users/${u.id}/role`), {
+                                method: "PATCH",
+                                headers: {
+                                  Authorization: `Bearer ${token.access}`,
+                                  "X-Space-Id": activeSpaceId,
+                                  "Content-Type": "application/json",
+                                },
+                                body: JSON.stringify({ role: nextRole }),
+                              });
+                              const data = await res.json().catch(() => ({}));
+                              if (!res.ok) throw new Error(data?.detail ?? "Не удалось обновить роль");
+                              setOrgUsers((prev) => prev.map((it) => (it.id === u.id ? { ...it, role: nextRole } : it)));
+                            } catch (e: any) {
+                              setOrgUsersError(e?.message ?? "Ошибка обновления роли");
+                            }
+                          }}
+                          className="rounded-xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] px-3 py-2 text-[var(--k-text)] outline-none min-w-[160px]"
+                        >
+                          <option value="user">{uiLanguage === "en" ? "User" : "Пользователь"}</option>
+                          <option value="executor">{uiLanguage === "en" ? "Executor" : "Исполнитель"}</option>
+                          <option value="manager">{uiLanguage === "en" ? "Manager" : "Менеджер"}</option>
+                          <option value="lead">{uiLanguage === "en" ? "Lead" : "Руководитель"}</option>
+                          <option value="admin">{uiLanguage === "en" ? "Admin" : "Администратор"}</option>
+                        </select>
+                      </div>
                     </div>
-                    <select
-                      value={u.role}
-                      onChange={async (e) => {
-                        if (!token || !activeSpaceId) return;
-                        const nextRole = e.target.value as OrgUser["role"];
-                        try {
-                          const res = await fetch(getApiUrl(`/api/auth/users/${u.id}/role`), {
-                            method: "PATCH",
-                            headers: {
-                              Authorization: `Bearer ${token.access}`,
-                              "X-Space-Id": activeSpaceId,
-                              "Content-Type": "application/json",
-                            },
-                            body: JSON.stringify({ role: nextRole }),
-                          });
-                          const data = await res.json().catch(() => ({}));
-                          if (!res.ok) throw new Error(data?.detail ?? "Не удалось обновить роль");
-                          setOrgUsers((prev) => prev.map((it) => (it.id === u.id ? { ...it, role: nextRole } : it)));
-                        } catch (e: any) {
-                          setOrgUsersError(e?.message ?? "Ошибка обновления роли");
-                        }
-                      }}
-                      className="rounded-xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] px-3 py-2 text-[var(--k-text)] outline-none"
-                    >
-                      <option value="user">{uiLanguage === "en" ? "User" : "Пользователь"}</option>
-                      <option value="manager">{uiLanguage === "en" ? "Manager" : "Менеджер"}</option>
-                      <option value="lead">{uiLanguage === "en" ? "Lead" : "Руководитель"}</option>
-                      <option value="admin">{uiLanguage === "en" ? "Admin" : "Администратор"}</option>
-                    </select>
                   </div>
                 ))}
                 {!orgUsers.length && !orgUsersLoading ? (
@@ -2439,6 +2661,104 @@ export default function AppHomePageImplGray() {
                 ) : null}
               </div>
             </div>
+
+            {adminEditUser ? (
+              <div
+                className="fixed inset-0 z-[160] flex items-center justify-center p-4 bg-black/50"
+                onClick={() => !adminEditBusy && setAdminEditUser(null)}
+                role="presentation"
+              >
+                <div
+                  className="w-full max-w-md rounded-2xl border border-[var(--k-border)] p-5 shadow-2xl"
+                  style={{ background: uiColors.cardBg }}
+                  onClick={(e) => e.stopPropagation()}
+                  role="dialog"
+                  aria-modal="true"
+                  aria-labelledby="admin-edit-user-title"
+                >
+                  <div id="admin-edit-user-title" className="font-bold text-[var(--k-text)] mb-3">
+                    {uiLanguage === "en" ? "Edit user" : "Редактирование пользователя"}
+                  </div>
+                  <div className="space-y-3">
+                    <label className="block">
+                      <div className="text-xs text-[var(--k-text-muted)] mb-1">{uiLanguage === "en" ? "Name" : "Имя"}</div>
+                      <input
+                        value={adminEditFullName}
+                        onChange={(e) => setAdminEditFullName(e.target.value)}
+                        className="w-full rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] px-3 py-2 text-[var(--k-text)] outline-none focus:border-[#8A2BE2]"
+                      />
+                    </label>
+                    <label className="block">
+                      <div className="text-xs text-[var(--k-text-muted)] mb-1">Email</div>
+                      <input
+                        value={adminEditEmail}
+                        onChange={(e) => setAdminEditEmail(e.target.value)}
+                        type="email"
+                        className="w-full rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] px-3 py-2 text-[var(--k-text)] outline-none focus:border-[#8A2BE2]"
+                      />
+                    </label>
+                  </div>
+                  <div className="mt-4 flex justify-end gap-2 flex-wrap">
+                    <GreyButton variant="soft" disabled={adminEditBusy} onClick={() => setAdminEditUser(null)}>
+                      {uiLanguage === "en" ? "Cancel" : "Отмена"}
+                    </GreyButton>
+                    <GreyButton
+                      variant="primary"
+                      disabled={adminEditBusy || !adminEditFullName.trim() || !adminEditEmail.trim()}
+                      onClick={async () => {
+                        if (!token || !activeSpaceId || !adminEditUser) return;
+                        setAdminEditBusy(true);
+                        setOrgUsersError(null);
+                        setOrgUsersSuccess(null);
+                        try {
+                          const res = await fetch(getApiUrl(`/api/auth/users/${adminEditUser.id}`), {
+                            method: "PATCH",
+                            headers: {
+                              Authorization: `Bearer ${token.access}`,
+                              "X-Space-Id": activeSpaceId,
+                              "Content-Type": "application/json",
+                            },
+                            body: JSON.stringify({
+                              full_name: adminEditFullName.trim(),
+                              email: adminEditEmail.trim().toLowerCase(),
+                            }),
+                          });
+                          const data = (await res.json().catch(() => ({}))) as Partial<OrgUser> & { detail?: string };
+                          if (!res.ok) throw new Error(data?.detail ?? "Не удалось сохранить");
+                          setOrgUsers((prev) =>
+                            prev.map((it) =>
+                              it.id === adminEditUser.id
+                                ? {
+                                    ...it,
+                                    full_name: (data.full_name as string) ?? adminEditFullName.trim(),
+                                    email: (data.email as string) ?? adminEditEmail.trim().toLowerCase(),
+                                    last_login: (data.last_login as string | null | undefined) ?? it.last_login,
+                                    role: (data.role as OrgUser["role"]) ?? it.role,
+                                  }
+                                : it,
+                            ),
+                          );
+                          setOrgUsersSuccess(uiLanguage === "en" ? "User updated" : "Пользователь обновлён");
+                          setAdminEditUser(null);
+                        } catch (e: any) {
+                          setOrgUsersError(e?.message ?? "Ошибка сохранения");
+                        } finally {
+                          setAdminEditBusy(false);
+                        }
+                      }}
+                    >
+                      {adminEditBusy
+                        ? uiLanguage === "en"
+                          ? "Saving…"
+                          : "Сохранение…"
+                        : uiLanguage === "en"
+                          ? "Save"
+                          : "Сохранить"}
+                    </GreyButton>
+                  </div>
+                </div>
+              </div>
+            ) : null}
           </div>
         )}
       </div>
@@ -2661,12 +2981,14 @@ export default function AppHomePageImplGray() {
           onClose={() => {
             setCreateTaskOpen(false);
             setCreateTaskColumnId(null);
+            setCreateTaskTrackId(null);
           }}
           token={access}
           refreshToken={token?.refresh}
           boardId={activeBoardId}
           columns={columns}
           defaultColumnId={createTaskColumnId}
+          defaultTrackId={createTaskTrackId}
           language={uiLanguage}
           onTokensUpdated={(nextTokens) => {
             setToken(nextTokens);

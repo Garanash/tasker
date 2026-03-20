@@ -41,6 +41,7 @@ import MapOutlinedIcon from "@mui/icons-material/MapOutlined";
 import DashboardOutlinedIcon from "@mui/icons-material/DashboardOutlined";
 import MoreVertIcon from "@mui/icons-material/MoreVert";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
+import SearchIcon from "@mui/icons-material/Search";
 
 const TEXT_GRAY = "var(--k-text-muted)";
 const TEXT_DARK = "var(--k-text)";
@@ -73,8 +74,10 @@ type Props = {
   onSelectBoard: (boardId: string) => void;
   onCreateSpace: () => void;
   onRenameSpace?: (spaceId: string, newName: string) => void | Promise<boolean>;
+  onRenameBoard?: (boardId: string, newName: string) => void | Promise<boolean>;
   /** false = ошибка (диалог не закрываем). void / true = успех. */
   onDeleteSpace?: (spaceId: string) => boolean | Promise<boolean> | void | Promise<void>;
+  onDeleteBoard?: (boardId: string) => boolean | Promise<boolean> | void | Promise<void>;
   onLogout: () => void;
   onClose?: () => void;
   onAddAction?: (action: AddMenuAction) => void;
@@ -85,6 +88,8 @@ type Props = {
   canCreateSpace?: boolean;
   /** lead/admin: переименование и удаление пространств */
   canManageSpaces?: boolean;
+  /** manager+: переименование и удаление досок */
+  canManageBoards?: boolean;
   isPinned?: boolean;
   onTogglePin?: () => void;
 };
@@ -102,7 +107,9 @@ export default function LeftSidebar({
   onSelectBoard,
   onCreateSpace,
   onRenameSpace,
+  onRenameBoard,
   onDeleteSpace,
+  onDeleteBoard,
   onLogout,
   onClose,
   onAddAction,
@@ -112,6 +119,7 @@ export default function LeftSidebar({
   canCreateEntities = true,
   canCreateSpace = false,
   canManageSpaces = false,
+  canManageBoards = false,
   isPinned = false,
   onTogglePin,
 }: Props) {
@@ -124,10 +132,16 @@ export default function LeftSidebar({
   const [editingName, setEditingName] = useState("");
 
   const [addMenuAnchor, setAddMenuAnchor] = useState<null | HTMLElement>(null);
+  const [sidebarSearch, setSidebarSearch] = useState("");
   const [spaceMenuAnchor, setSpaceMenuAnchor] = useState<null | HTMLElement>(null);
   const [spaceMenuForId, setSpaceMenuForId] = useState<string | null>(null);
+  const [boardMenuAnchor, setBoardMenuAnchor] = useState<null | HTMLElement>(null);
+  const [boardMenuForId, setBoardMenuForId] = useState<string | null>(null);
   const [deleteDialogSpace, setDeleteDialogSpace] = useState<{ id: string; name: string } | null>(null);
+  const [renameDialogBoard, setRenameDialogBoard] = useState<{ id: string; name: string } | null>(null);
+  const [deleteDialogBoard, setDeleteDialogBoard] = useState<{ id: string; name: string } | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
+  const [renameBoardBusy, setRenameBoardBusy] = useState(false);
 
   const t =
     language === "en"
@@ -154,6 +168,11 @@ export default function LeftSidebar({
           spacesSection: "Spaces",
           renameSpace: "Rename",
           deleteSpace: "Delete space",
+          renameBoard: "Rename board",
+          deleteBoard: "Delete board",
+          boardActions: "Board actions",
+          deleteBoardTitle: "Delete board?",
+          deleteBoardBody: "All columns, cards and related data in this board will be permanently removed.",
           deleteSpaceTitle: "Delete space?",
           deleteSpaceBody: "All boards, cards and data in this space will be permanently removed.",
           cancel: "Cancel",
@@ -183,6 +202,11 @@ export default function LeftSidebar({
           spacesSection: "Пространства",
           renameSpace: "Переименовать",
           deleteSpace: "Удалить пространство",
+          renameBoard: "Переименовать доску",
+          deleteBoard: "Удалить доску",
+          boardActions: "Действия с доской",
+          deleteBoardTitle: "Удалить доску?",
+          deleteBoardBody: "Все колонки, карточки и связанные данные на этой доске будут удалены безвозвратно.",
           deleteSpaceTitle: "Удалить пространство?",
           deleteSpaceBody:
             "Все доски, карточки и данные в этом пространстве будут безвозвратно удалены.",
@@ -190,10 +214,6 @@ export default function LeftSidebar({
           confirmDelete: "Удалить",
           spaceActions: "Действия с пространством",
         };
-
-  const activeBoards = boards.filter((b) => !b.space_id || b.space_id === activeSpaceId);
-  const activeProjects = projects.filter((p) => !p.space_id || p.space_id === activeSpaceId);
-  const activeBoardsUngrouped = activeBoards.filter((b) => !b.project_id || !activeProjects.some((p) => p.id === b.project_id));
 
   const startRenaming = (spaceId: string, currentName: string) => {
     setEditingSpaceId(spaceId);
@@ -218,6 +238,10 @@ export default function LeftSidebar({
     setSpaceMenuAnchor(null);
     setSpaceMenuForId(null);
   };
+  const closeBoardMenu = () => {
+    setBoardMenuAnchor(null);
+    setBoardMenuForId(null);
+  };
 
   const confirmDeleteSpace = async () => {
     if (!deleteDialogSpace || !onDeleteSpace) return;
@@ -229,6 +253,28 @@ export default function LeftSidebar({
       }
     } catch {
       /* не бросаем наружу — избегаем сбоев портала Next.js / необработанного rejection */
+    } finally {
+      setDeleteBusy(false);
+    }
+  };
+
+  const confirmRenameBoard = async () => {
+    if (!renameDialogBoard || !onRenameBoard || !renameDialogBoard.name.trim()) return;
+    setRenameBoardBusy(true);
+    try {
+      const result = await Promise.resolve(onRenameBoard(renameDialogBoard.id, renameDialogBoard.name.trim()));
+      if (result !== false) setRenameDialogBoard(null);
+    } finally {
+      setRenameBoardBusy(false);
+    }
+  };
+
+  const confirmDeleteBoard = async () => {
+    if (!deleteDialogBoard || !onDeleteBoard) return;
+    setDeleteBusy(true);
+    try {
+      const result = await Promise.resolve(onDeleteBoard(deleteDialogBoard.id));
+      if (result !== false) setDeleteDialogBoard(null);
     } finally {
       setDeleteBusy(false);
     }
@@ -316,6 +362,56 @@ export default function LeftSidebar({
               <CloseIcon sx={{ fontSize: 18 }} />
             </IconButton>
           )}
+        </Box>
+      </Box>
+
+      <Box sx={{ px: 1.5, pt: 1, pb: 0.75 }}>
+        <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+          <Box
+            sx={{
+              flex: 1,
+              display: "flex",
+              alignItems: "center",
+              gap: 0.75,
+              border: `1px solid ${BORDER_GRAY}`,
+              borderRadius: 1.5,
+              px: 1,
+              py: 0.5,
+              bgcolor: "var(--k-page-bg)",
+            }}
+          >
+            <SearchIcon sx={{ color: TEXT_GRAY, fontSize: 16 }} />
+            <InputBase
+              value={sidebarSearch}
+              onChange={(e) => setSidebarSearch(e.target.value)}
+              placeholder={language === "en" ? "Search" : "Найти"}
+              sx={{
+                flex: 1,
+                fontSize: 13,
+                color: TEXT_DARK,
+                "& input::placeholder": { color: TEXT_GRAY, opacity: 1 },
+              }}
+            />
+          </Box>
+          {canCreateEntities ? (
+            <IconButton
+              size="small"
+              data-testid="add-button-entity"
+              aria-label={t.add}
+              onClick={handleAddMenuClick}
+              sx={{
+                width: 34,
+                height: 34,
+                borderRadius: 1.5,
+                border: `1px solid ${BORDER_GRAY}`,
+                bgcolor: "var(--k-surface-bg)",
+                color: ACCENT_PURPLE,
+                "&:hover": { bgcolor: HOVER_BG },
+              }}
+            >
+              <AddIcon sx={{ fontSize: 18 }} />
+            </IconButton>
+          ) : null}
         </Box>
       </Box>
 
@@ -528,135 +624,71 @@ export default function LeftSidebar({
                     </ListItemButton>
                   </ListItem>
                 )}
+                {space.id === activeSpaceId ? (
+                  <Box sx={{ pl: 2.5, pr: 0.5, pb: 0.5 }}>
+                    {boards
+                      .filter((board) => board.space_id === space.id)
+                      .map((board) => (
+                        <ListItem
+                          disablePadding
+                          key={board.id}
+                          secondaryAction={
+                            canManageBoards && (onRenameBoard || onDeleteBoard) ? (
+                              <Tooltip title={t.boardActions}>
+                                <IconButton
+                                  edge="end"
+                                  size="small"
+                                  aria-label={t.boardActions}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    e.preventDefault();
+                                    setBoardMenuAnchor(e.currentTarget);
+                                    setBoardMenuForId(board.id);
+                                  }}
+                                  sx={{ mr: 0.25 }}
+                                >
+                                  <MoreVertIcon sx={{ fontSize: 16, color: TEXT_GRAY }} />
+                                </IconButton>
+                              </Tooltip>
+                            ) : undefined
+                          }
+                          sx={{
+                            "& .MuiListItemSecondaryAction-root": { right: 0 },
+                            pr: canManageBoards && (onRenameBoard || onDeleteBoard) ? 3.5 : 0,
+                          }}
+                        >
+                          <ListItemButton
+                            selected={board.id === activeBoardId}
+                            onClick={() => {
+                              onSelectBoard(board.id);
+                              if (!isPinned) onClose?.();
+                            }}
+                            sx={{
+                              borderRadius: 1,
+                              py: 0.4,
+                              "&.Mui-selected": { bgcolor: SELECTED_BG },
+                              "&:hover": { bgcolor: HOVER_BG },
+                            }}
+                          >
+                            <ListItemIcon sx={{ minWidth: 24 }}>
+                              <DashboardOutlinedIcon sx={{ color: TEXT_GRAY, fontSize: 14 }} />
+                            </ListItemIcon>
+                            <ListItemText
+                              primary={board.name}
+                              primaryTypographyProps={{ fontSize: 12, color: TEXT_DARK }}
+                            />
+                          </ListItemButton>
+                        </ListItem>
+                      ))}
+                  </Box>
+                ) : null}
               </Box>
             ))}
           </List>
-
-          {/* Доски текущего пространства */}
-          {activeProjects.length > 0 && (
-            <Box sx={{ px: 2, py: 0.5 }}>
-              <Typography
-                sx={{ fontSize: 11, fontWeight: 700, color: TEXT_GRAY, textTransform: "uppercase", mb: 0.5 }}
-              >
-                {t.folders}
-              </Typography>
-              <List dense disablePadding>
-                {activeProjects.map((project) => {
-                  const projectBoards = activeBoards.filter((b) => b.project_id === project.id);
-                  return (
-                    <Box key={project.id}>
-                      <ListItemButton
-                        selected={project.id === activeProjectId}
-                        onClick={() => onSelectProject?.(project.id)}
-                        sx={{
-                          borderRadius: 1,
-                          py: 0.5,
-                          "&.Mui-selected": { bgcolor: SELECTED_BG },
-                          "&:hover": { bgcolor: HOVER_BG },
-                        }}
-                      >
-                        <ListItemIcon sx={{ minWidth: 28 }}>
-                          <FolderOutlinedIcon sx={{ color: TEXT_GRAY, fontSize: 16 }} />
-                        </ListItemIcon>
-                        <ListItemText
-                          primary={project.name}
-                          primaryTypographyProps={{ fontSize: 13, color: TEXT_DARK }}
-                        />
-                      </ListItemButton>
-                      {projectBoards.map((board) => (
-                        <ListItemButton
-                          key={board.id}
-                          selected={board.id === activeBoardId}
-                          onClick={() => {
-                            onSelectBoard(board.id);
-                            if (!isPinned) onClose?.();
-                          }}
-                          sx={{
-                            ml: 2.5,
-                            borderRadius: 1,
-                            py: 0.35,
-                            "&.Mui-selected": { bgcolor: SELECTED_BG },
-                            "&:hover": { bgcolor: HOVER_BG },
-                          }}
-                        >
-                          <ListItemIcon sx={{ minWidth: 24 }}>
-                            <DashboardOutlinedIcon sx={{ color: TEXT_GRAY, fontSize: 14 }} />
-                          </ListItemIcon>
-                          <ListItemText
-                            primary={board.name}
-                            primaryTypographyProps={{ fontSize: 12, color: TEXT_DARK }}
-                          />
-                        </ListItemButton>
-                      ))}
-                    </Box>
-                  );
-                })}
-              </List>
-            </Box>
-          )}
-
-          {activeBoardsUngrouped.length > 0 && (
-            <Box sx={{ px: 2, py: 0.5 }}>
-              <Typography
-                sx={{ fontSize: 11, fontWeight: 700, color: TEXT_GRAY, textTransform: "uppercase", mb: 0.5 }}
-              >
-                {t.boards}
-              </Typography>
-              <List dense disablePadding>
-                {activeBoardsUngrouped.map((board) => (
-                  <ListItemButton
-                    key={board.id}
-                    selected={board.id === activeBoardId}
-                    onClick={() => {
-                      onSelectBoard(board.id);
-                      if (!isPinned) onClose?.();
-                    }}
-                    sx={{
-                      borderRadius: 1,
-                      py: 0.5,
-                      "&.Mui-selected": { bgcolor: SELECTED_BG },
-                      "&:hover": { bgcolor: HOVER_BG },
-                    }}
-                  >
-                    <ListItemIcon sx={{ minWidth: 28 }}>
-                      <DashboardOutlinedIcon sx={{ color: TEXT_GRAY, fontSize: 16 }} />
-                    </ListItemIcon>
-                    <ListItemText
-                      primary={board.name}
-                      primaryTypographyProps={{ fontSize: 13, color: TEXT_DARK }}
-                    />
-                  </ListItemButton>
-                ))}
-              </List>
-            </Box>
-          )}
         </Collapse>
       </Box>
 
       <Divider sx={{ borderColor: BORDER_GRAY }} />
-
-      {canCreateEntities && (
-        <Box sx={{ p: 1 }}>
-          <ListItemButton
-            onClick={handleAddMenuClick}
-            data-testid="add-button-space-entity"
-            sx={{
-              borderRadius: 1,
-              py: 1,
-              bgcolor: "var(--k-hover, #F5F5F5)",
-              "&:hover": { bgcolor: "var(--k-active, #E8E8E8)" },
-            }}
-          >
-            <ListItemIcon sx={{ minWidth: 32 }}>
-              <AddIcon sx={{ color: ACCENT_PURPLE, fontSize: 20 }} />
-            </ListItemIcon>
-            <ListItemText
-              primary={t.add}
-              primaryTypographyProps={{ fontSize: 13, fontWeight: 500, color: TEXT_DARK }}
-            />
-          </ListItemButton>
-        </Box>
-      )}
 
       {/* Меню добавления */}
       <Menu
@@ -679,10 +711,6 @@ export default function LeftSidebar({
         <Typography sx={{ px: 2, py: 1, fontSize: 12, color: TEXT_GRAY, fontWeight: 500 }}>
           {t.add}
         </Typography>
-        <MenuItem onClick={() => handleAddAction("folder")} sx={{ py: 1, gap: 1.5 }}>
-          <FolderOutlinedIcon sx={{ color: TEXT_GRAY, fontSize: 20 }} />
-          <Typography sx={{ fontSize: 14 }}>{t.folder}</Typography>
-        </MenuItem>
         {canCreateSpace && (
           <MenuItem onClick={() => handleAddAction("space")} sx={{ py: 1, gap: 1.5 }}>
             <GridViewIcon sx={{ color: TEXT_GRAY, fontSize: 20 }} />
@@ -697,16 +725,65 @@ export default function LeftSidebar({
           <DescriptionOutlinedIcon sx={{ color: TEXT_GRAY, fontSize: 20 }} />
           <Typography sx={{ fontSize: 14 }}>{t.document}</Typography>
         </MenuItem>
-
+        <MenuItem onClick={() => handleAddAction("folder")} sx={{ py: 1, gap: 1.5 }}>
+          <FolderOutlinedIcon sx={{ color: TEXT_GRAY, fontSize: 20 }} />
+          <Typography sx={{ fontSize: 14 }}>{t.folder}</Typography>
+        </MenuItem>
         <Divider sx={{ my: 1 }} />
-
-        <Typography sx={{ px: 2, py: 0.5, fontSize: 12, color: TEXT_GRAY, fontWeight: 500 }}>
-          {t.forSpace}
-        </Typography>
+        <MenuItem disabled sx={{ py: 1, gap: 1.5, opacity: 0.7 }}>
+          <MapOutlinedIcon sx={{ color: TEXT_GRAY, fontSize: 20 }} />
+          <Typography sx={{ fontSize: 14 }}>
+            {language === "en" ? "Import Story map" : "Импортировать Story map"}
+          </Typography>
+        </MenuItem>
+        <MenuItem disabled sx={{ py: 1, gap: 1.5, opacity: 0.7 }}>
+          <DashboardOutlinedIcon sx={{ color: TEXT_GRAY, fontSize: 20 }} />
+          <Typography sx={{ fontSize: 14 }}>
+            {language === "en" ? "Import" : "Импортировать"}
+          </Typography>
+        </MenuItem>
+        <Divider sx={{ my: 1 }} />
         <MenuItem onClick={() => handleAddAction("board")} sx={{ py: 1, gap: 1.5 }}>
           <DashboardOutlinedIcon sx={{ color: TEXT_GRAY, fontSize: 20 }} />
           <Typography sx={{ fontSize: 14 }}>{t.board}</Typography>
         </MenuItem>
+      </Menu>
+
+      <Menu
+        anchorEl={boardMenuAnchor}
+        open={Boolean(boardMenuAnchor) && Boolean(boardMenuForId)}
+        onClose={closeBoardMenu}
+        anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
+        transformOrigin={{ vertical: "top", horizontal: "right" }}
+      >
+        {onRenameBoard ? (
+          <MenuItem
+            onClick={() => {
+              const bid = boardMenuForId;
+              const board = bid ? boards.find((b) => b.id === bid) : undefined;
+              closeBoardMenu();
+              if (board) setRenameDialogBoard({ id: board.id, name: board.name });
+            }}
+            sx={{ py: 1, gap: 1 }}
+          >
+            <EditOutlinedIcon sx={{ color: TEXT_GRAY, fontSize: 18 }} />
+            <Typography sx={{ fontSize: 14 }}>{t.renameBoard}</Typography>
+          </MenuItem>
+        ) : null}
+        {onDeleteBoard ? (
+          <MenuItem
+            onClick={() => {
+              const bid = boardMenuForId;
+              const board = bid ? boards.find((b) => b.id === bid) : undefined;
+              closeBoardMenu();
+              if (board) setDeleteDialogBoard({ id: board.id, name: board.name });
+            }}
+            sx={{ py: 1, gap: 1, color: "error.main" }}
+          >
+            <DeleteOutlineIcon sx={{ fontSize: 18 }} />
+            <Typography sx={{ fontSize: 14 }}>{t.deleteBoard}</Typography>
+          </MenuItem>
+        ) : null}
       </Menu>
 
       <Menu
@@ -810,6 +887,78 @@ export default function LeftSidebar({
             color="error"
             onClick={() => void confirmDeleteSpace()}
             disabled={deleteBusy || !onDeleteSpace}
+          >
+            {deleteBusy ? "…" : t.confirmDelete}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(renameDialogBoard)}
+        onClose={() => !renameBoardBusy && setRenameDialogBoard(null)}
+        fullWidth
+        maxWidth="xs"
+      >
+        <DialogTitle sx={{ fontSize: 18, fontWeight: 700 }}>{t.renameBoard}</DialogTitle>
+        <DialogContent>
+          <InputBase
+            autoFocus
+            value={renameDialogBoard?.name ?? ""}
+            onChange={(e) => setRenameDialogBoard((prev) => (prev ? { ...prev, name: e.target.value } : prev))}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void confirmRenameBoard();
+            }}
+            sx={{
+              mt: 1,
+              width: "100%",
+              fontSize: 14,
+              px: 1.5,
+              py: 1,
+              border: `1px solid ${BORDER_GRAY}`,
+              borderRadius: 1,
+              bgcolor: "var(--k-page-bg)",
+              color: TEXT_DARK,
+            }}
+          />
+        </DialogContent>
+        <DialogActions sx={{ px: 2, pb: 2 }}>
+          <Button onClick={() => setRenameDialogBoard(null)} disabled={renameBoardBusy} sx={{ color: TEXT_GRAY }}>
+            {t.cancel}
+          </Button>
+          <Button
+            variant="contained"
+            onClick={() => void confirmRenameBoard()}
+            disabled={renameBoardBusy || !renameDialogBoard?.name.trim()}
+          >
+            {renameBoardBusy ? "…" : t.renameBoard}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(deleteDialogBoard)}
+        onClose={() => !deleteBusy && setDeleteDialogBoard(null)}
+        fullWidth
+        maxWidth="xs"
+      >
+        <DialogTitle sx={{ fontSize: 18, fontWeight: 700 }}>{t.deleteBoardTitle}</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" sx={{ color: TEXT_GRAY, mb: 1 }}>
+            <strong>{deleteDialogBoard?.name}</strong>
+          </Typography>
+          <Typography variant="body2" sx={{ color: TEXT_GRAY }}>
+            {t.deleteBoardBody}
+          </Typography>
+        </DialogContent>
+        <DialogActions sx={{ px: 2, pb: 2 }}>
+          <Button onClick={() => setDeleteDialogBoard(null)} disabled={deleteBusy} sx={{ color: TEXT_GRAY }}>
+            {t.cancel}
+          </Button>
+          <Button
+            variant="contained"
+            color="error"
+            onClick={() => void confirmDeleteBoard()}
+            disabled={deleteBusy || !onDeleteBoard}
           >
             {deleteBusy ? "…" : t.confirmDelete}
           </Button>

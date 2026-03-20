@@ -148,7 +148,7 @@ export function CardModal({
     value: unknown;
     field_type?: string;
   }) => Promise<void>;
-  users?: Array<{ id: string; email: string; full_name: string; role: "user" | "manager" | "lead" | "admin" }>;
+  users?: Array<{ id: string; email: string; full_name: string; role: "user" | "executor" | "manager" | "lead" | "admin" }>;
   availableColumns?: Array<{ id: string; name: string; is_done: boolean }>;
   isFavorite?: boolean;
   onToggleFavorite?: () => void;
@@ -865,7 +865,7 @@ export function CardModal({
 
   return (
     <div
-      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 p-4"
+      className="fixed inset-0 z-[100] flex items-start justify-center bg-black/45 p-4 md:p-6"
       role="dialog"
       aria-modal="true"
       onClick={() => {
@@ -875,10 +875,10 @@ export function CardModal({
       }}
     >
       <div
-        className="w-full max-w-[740px] h-[min(92vh,791px)] overflow-hidden rounded-2xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] shadow-xl flex flex-col relative"
+        className="w-full max-w-[1260px] h-[min(94vh,860px)] overflow-hidden rounded-3xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] shadow-2xl flex flex-col relative mt-6"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="p-6 border-b border-[var(--k-border)] flex items-start justify-between gap-4">
+        <div className="px-8 py-6 border-b border-[var(--k-border)] flex items-start justify-between gap-4 bg-[var(--k-surface-bg)]">
             <div className="min-w-0 flex-1">
               <div className="flex items-start gap-2">
                 <input
@@ -892,7 +892,7 @@ export function CardModal({
                     }
                   }}
                   disabled={!onUpdateCard}
-                  className="w-full bg-transparent text-[var(--k-text)] text-2xl font-bold tracking-tight outline-none border-b border-transparent focus:border-[var(--k-border)] pb-1 disabled:opacity-60"
+                  className="w-full bg-transparent text-[var(--k-text)] text-[30px] leading-tight font-extrabold tracking-tight outline-none border-b border-transparent focus:border-[var(--k-border)] pb-1 disabled:opacity-60"
                   placeholder={locale === "en" ? "Task title" : "Название задачи"}
                 />
                 {titleSaving ? (
@@ -978,7 +978,9 @@ export function CardModal({
           </div>
         ) : null}
 
-        <div className="flex-1 overflow-y-auto overscroll-contain p-6 space-y-4">
+        <div className="flex-1 overflow-y-auto overscroll-contain px-8 py-6 bg-[var(--k-page-bg)]">
+          <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_420px] gap-5 items-start">
+            <div className="space-y-4 min-w-0">
 
           <div className="rounded-2xl border border-[var(--k-border)] bg-[var(--k-page-bg)] p-4 space-y-4">
             <div>
@@ -1489,56 +1491,61 @@ export function CardModal({
         </div>
       </div>
 
-      <div className="rounded-2xl border border-[var(--k-border)] bg-[var(--k-page-bg)] p-4 space-y-3">
-        <div className="flex items-center justify-between gap-4">
-          <div className="text-xs font-semibold uppercase tracking-wider text-[var(--k-text-muted)]">{t.comments}</div>
-          <div className="text-[var(--k-text-muted)] text-xs">
-            {card.comments.length} {locale === "en" ? "items" : "шт."}
-          </div>
-        </div>
-        <div className="mt-2 text-[var(--k-text-muted)] text-xs">{t.all}</div>
+            </div>
 
-        <div className="mt-3 space-y-3">
-          {card.comments.length ? (
-            card.comments.map((c) => (
-              <div key={c.id} className="rounded-xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] p-3">
-                <div className="flex items-baseline justify-between gap-3">
-                  <div className="text-[var(--k-text)] text-sm font-semibold truncate">
-                    {c.author_full_name || c.author_email}
-                  </div>
+            <div className="lg:sticky lg:top-0">
+              <div className="rounded-2xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] p-5 space-y-3 min-h-[520px] max-h-[min(80vh,760px)] overflow-hidden flex flex-col">
+                <div className="flex items-center justify-between gap-4">
+                  <div className="text-xs font-semibold uppercase tracking-wider text-[var(--k-text-muted)]">{t.comments}</div>
                   <div className="text-[var(--k-text-muted)] text-xs">
-                    {c.created_at ? new Date(c.created_at).toLocaleString(locale === "en" ? "en-US" : "ru-RU") : ""}
+                    {card.comments.length} {locale === "en" ? "items" : "шт."}
                   </div>
                 </div>
-                <div className="text-[var(--k-text-muted)] text-sm mt-2 whitespace-pre-wrap">{c.body}</div>
-              </div>
-            ))
-          ) : (
-            <div className="text-[var(--k-text-muted)] text-sm">{t.noComments}</div>
-          )}
-        </div>
+                <div className="text-[var(--k-text-muted)] text-xs">{t.all}</div>
 
-        {onAddComment ? (
-          <div className="mt-4">
-            <textarea
-              value={commentBody}
-              onChange={(e) => setCommentBody(e.target.value)}
-              rows={3}
-              className="w-full resize-none rounded-2xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] p-3 text-[var(--k-text)] outline-none focus:border-[#8A2BE2]"
-              placeholder={t.writeComment}
-            />
-            <div className="mt-3 flex items-center justify-end gap-3">
-              <button
-                onClick={() => submitComment()}
-                disabled={commentBusy}
-                className="px-6 py-2 rounded-full bg-gradient-to-r from-[#8A2BE2] to-[#4B0082] text-white font-semibold transition-colors hover:bg-gray-300 disabled:opacity-60 disabled:cursor-not-allowed"
-              >
-                {commentBusy ? t.sending : t.send}
-              </button>
+                <div className="space-y-3 flex-1 overflow-y-auto pr-1">
+                  {card.comments.length ? (
+                    card.comments.map((c) => (
+                      <div key={c.id} className="rounded-xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] p-3">
+                        <div className="flex items-baseline justify-between gap-3">
+                          <div className="text-[var(--k-text)] text-sm font-semibold truncate">
+                            {c.author_full_name || c.author_email}
+                          </div>
+                          <div className="text-[var(--k-text-muted)] text-xs">
+                            {c.created_at ? new Date(c.created_at).toLocaleString(locale === "en" ? "en-US" : "ru-RU") : ""}
+                          </div>
+                        </div>
+                        <div className="text-[var(--k-text-muted)] text-sm mt-2 whitespace-pre-wrap">{c.body}</div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="text-[var(--k-text-muted)] text-sm">{t.noComments}</div>
+                  )}
+                </div>
+
+                {onAddComment ? (
+                  <div className="pt-2 border-t border-[var(--k-border)]">
+                    <textarea
+                      value={commentBody}
+                      onChange={(e) => setCommentBody(e.target.value)}
+                      rows={3}
+                      className="w-full resize-none rounded-2xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] p-3 text-[var(--k-text)] outline-none focus:border-[#8A2BE2]"
+                      placeholder={t.writeComment}
+                    />
+                    <div className="mt-3 flex items-center justify-end gap-3">
+                      <button
+                        onClick={() => submitComment()}
+                        disabled={commentBusy}
+                        className="px-6 py-2 rounded-full bg-gradient-to-r from-[#8A2BE2] to-[#4B0082] text-white font-semibold transition-colors hover:bg-gray-300 disabled:opacity-60 disabled:cursor-not-allowed"
+                      >
+                        {commentBusy ? t.sending : t.send}
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
             </div>
           </div>
-        ) : null}
-        </div>
         {localNotice ? (
           <div className="mt-4 rounded-xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] p-3 text-sm text-[var(--k-text)]">
             {localNotice}

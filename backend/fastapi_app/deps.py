@@ -67,6 +67,7 @@ async def require_space_access(request: Request) -> None:
 
 ROLE_PRIORITY = {
     "user": 1,
+    "executor": 2,
     "manager": 2,
     "support": 2,
     "lead": 3,

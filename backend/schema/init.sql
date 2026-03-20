@@ -21,7 +21,9 @@ CREATE TABLE IF NOT EXISTS core_user (
     is_superuser boolean NOT NULL DEFAULT false,
     created_at timestamptz NOT NULL DEFAULT now(),
     last_login timestamptz,
-    avatar_url varchar(2048) NOT NULL DEFAULT ''
+    avatar_url varchar(2048) NOT NULL DEFAULT '',
+    login_otp_hash varchar(256),
+    login_otp_expires_at timestamptz
 );
 
 -- 3. core_organizationmember
@@ -132,6 +134,41 @@ CREATE TABLE IF NOT EXISTS core_cardcomment (
     author_id uuid NOT NULL REFERENCES core_user(id) ON DELETE CASCADE,
     body text NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- 13.1 core_cardassignment
+CREATE TABLE IF NOT EXISTS core_cardassignment (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    card_id uuid NOT NULL REFERENCES core_card(id) ON DELETE CASCADE,
+    user_id uuid NOT NULL REFERENCES core_user(id) ON DELETE CASCADE,
+    assigned_by_id uuid REFERENCES core_user(id) ON DELETE SET NULL,
+    assigned_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE(card_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS core_cardassignment_user_idx ON core_cardassignment(user_id);
+CREATE INDEX IF NOT EXISTS core_cardassignment_card_idx ON core_cardassignment(card_id);
+
+-- 13.2 core_cardcommentreadstate
+CREATE TABLE IF NOT EXISTS core_cardcommentreadstate (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    card_id uuid NOT NULL REFERENCES core_card(id) ON DELETE CASCADE,
+    user_id uuid NOT NULL REFERENCES core_user(id) ON DELETE CASCADE,
+    last_seen_comment_at timestamptz NOT NULL DEFAULT to_timestamp(0),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE(card_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS core_cardcommentreadstate_user_idx ON core_cardcommentreadstate(user_id);
+CREATE INDEX IF NOT EXISTS core_cardcommentreadstate_card_idx ON core_cardcommentreadstate(card_id);
+
+-- 13.3 core_commentattachmentlink
+CREATE TABLE IF NOT EXISTS core_commentattachmentlink (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    comment_id uuid NOT NULL REFERENCES core_cardcomment(id) ON DELETE CASCADE,
+    attachment_id uuid NOT NULL REFERENCES core_attachment(id) ON DELETE CASCADE,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE(comment_id, attachment_id)
 );
 
 -- 14. core_cardmovementevent
