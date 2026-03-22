@@ -40,6 +40,14 @@ WORKFLOW_COLUMNS: list[tuple[str, bool]] = [
 ]
 WORKFLOW_COLUMN_NAMES = {name for name, _ in WORKFLOW_COLUMNS}
 DEFAULT_BACKLOG_COLUMN_NAME = WORKFLOW_COLUMNS[0][0]
+WORKFLOW_TODO_COLUMN_NAME = "К выполнению"
+WORKFLOW_IN_PROGRESS_COLUMN_NAME = "В работе"
+WORKFLOW_REVIEW_COLUMN_NAME = "Проверка"
+WORKFLOW_PUBLISH_COLUMN_NAME = "Размещение"
+WORKFLOW_DONE_COLUMN_NAME = "Выполнено"
+ARCHIVED_FIELD_KEY = "is_archived"
+ARCHIVED_AT_FIELD_KEY = "archived_at"
+ARCHIVED_EFFORT_SECONDS_FIELD_KEY = "archive_total_labor_seconds"
 
 
 async def _ensure_kanban_extensions(conn: asyncpg.Connection) -> None:
@@ -171,6 +179,66 @@ async def _can_executor_work_with_card(conn: asyncpg.Connection, user_id: str, c
         user_id,
     )
     return bool(assignee)
+
+
+def _jsonish_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        return s in {"1", "true", "yes", "y", "on"}
+    return False
+
+
+async def _upsert_card_field_value_by_key(
+    conn: asyncpg.Connection,
+    *,
+    card_id: str,
+    space_id: str,
+    key: str,
+    name: str,
+    value: Any,
+    field_type: str = "text",
+) -> None:
+    definition = await conn.fetchrow(
+        """
+        SELECT id
+        FROM core_cardfielddefinition
+        WHERE space_id = $1::uuid AND key = $2
+        LIMIT 1
+        """,
+        space_id,
+        key,
+    )
+    definition_id = str(definition["id"]) if definition else str(uuid.uuid4())
+    if not definition:
+        await conn.execute(
+            """
+            INSERT INTO core_cardfielddefinition (id, space_id, key, name, field_type, created_at)
+            VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6)
+            """,
+            definition_id,
+            space_id,
+            key,
+            name,
+            field_type,
+            datetime.now(timezone.utc),
+        )
+    await conn.execute(
+        """
+        INSERT INTO core_cardfieldvalue (id, card_id, definition_id, value, updated_at)
+        VALUES ($1::uuid, $2::uuid, $3::uuid, $4::jsonb, $5)
+        ON CONFLICT (card_id, definition_id)
+        DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
+        """,
+        str(uuid.uuid4()),
+        card_id,
+        definition_id,
+        json.dumps(value),
+        datetime.now(timezone.utc),
+    )
 
 
 async def _require_manager_for_space_org(space_id: str, user_id: str) -> tuple[str, str]:
@@ -1374,6 +1442,7 @@ async def board_grid(
 
         card_ids = [str(c["id"]) for c in cards]
         card_meta: dict[str, dict[str, Any]] = {}
+        executor_assigned_card_ids: set[str] = set()
         if card_ids:
             rows = await conn.fetch(
                 """
@@ -1401,6 +1470,15 @@ async def board_grid(
                     meta["assignee_name"] = value if isinstance(value, str) else None
                 elif key == "assignee_user_id":
                     meta["assignee_user_id"] = value if isinstance(value, str) else None
+                elif key == ARCHIVED_FIELD_KEY:
+                    meta["is_archived"] = _jsonish_bool(value)
+                elif key == ARCHIVED_AT_FIELD_KEY:
+                    meta["archived_at"] = str(value).strip() if value is not None else None
+                elif key == ARCHIVED_EFFORT_SECONDS_FIELD_KEY:
+                    try:
+                        meta["archive_total_labor_seconds"] = float(value)
+                    except Exception:
+                        meta["archive_total_labor_seconds"] = 0.0
                 elif key == "blocked_count":
                     try:
                         meta["blocked_count"] = int(value)
@@ -1465,11 +1543,48 @@ async def board_grid(
                     if au:
                         meta["assignee_avatar_url"] = au
 
+            if effective_role == "executor":
+                assigned_rows = await conn.fetch(
+                    "SELECT card_id::text AS card_id FROM core_cardassignment WHERE user_id = $1::uuid",
+                    user_id,
+                )
+                executor_assigned_card_ids = {str(r["card_id"]) for r in assigned_rows}
+
+    col_name_by_id = {str(c["id"]): str(c["name"] or "") for c in columns}
+    col_id_by_name = {str(c["name"] or ""): str(c["id"]) for c in columns}
+    todo_col_id = col_id_by_name.get(WORKFLOW_TODO_COLUMN_NAME)
+    in_progress_col_id = col_id_by_name.get(WORKFLOW_IN_PROGRESS_COLUMN_NAME)
+
     by_col = {str(c["id"]): [] for c in columns}
     for card in cards:
         cid = str(card["id"])
-        by_col[str(card["column_id"])].append(_card_lite(card, card_meta.get(cid, {})))
+        meta = card_meta.get(cid, {})
+        if _jsonish_bool(meta.get("is_archived")):
+            continue
+        if effective_role == "executor" and cid not in executor_assigned_card_ids:
+            continue
 
+        original_column_id = str(card["column_id"])
+        target_column_id = original_column_id
+        if (
+            effective_role in {"manager", "admin"}
+            and meta.get("assignee_user_id")
+            and todo_col_id
+            and in_progress_col_id
+            and original_column_id == todo_col_id
+        ):
+            # Для manager/admin назначенная задача визуально считается «В работе».
+            target_column_id = in_progress_col_id
+
+        card_payload = _card_lite(card, meta)
+        card_payload["column_id"] = target_column_id
+        card_payload["source_column_id"] = original_column_id
+        card_payload["source_column_name"] = col_name_by_id.get(original_column_id, "")
+        by_col[target_column_id].append(card_payload)
+
+    visible_columns = columns
+    if effective_role == "executor":
+        visible_columns = [c for c in columns if str(c["name"] or "").strip() != DEFAULT_BACKLOG_COLUMN_NAME]
     return {
         "board": {"id": str(board["id"]), "name": board["name"]},
         "effective_role": effective_role,
@@ -1483,7 +1598,7 @@ async def board_grid(
                 "wip_limit": int(c["wip_limit"]) if c["wip_limit"] is not None else None,
                 "cards": by_col[str(c["id"])],
             }
-            for c in columns
+            for c in visible_columns
         ],
     }
 
@@ -1552,14 +1667,26 @@ async def card_move(
         )
         if not space:
             raise HTTPException(status_code=404, detail="Доска не найдена")
-        await get_effective_role(user_id, str(space["organization_id"]))
-        # Исполнитель: может переносить карточки по колонкам доски (смена статуса в workflow), без проверки назначения.
+        role = await get_effective_role(user_id, str(space["organization_id"]))
         space_id_h = request.headers.get("x-space-id")
         if space_id_h and str(space["space_id"]) != space_id_h:
             raise HTTPException(status_code=403, detail="Карточка вне активного space")
         to_col = await conn.fetchrow("SELECT id, board_id FROM core_column WHERE id = $1::uuid", str(to_column_id))
         if not to_col or str(to_col["board_id"]) != str(card["board_id"]):
             raise HTTPException(status_code=400, detail="Некорректный переход: колонка не принадлежит доске")
+        from_col_name = (await conn.fetchval("SELECT name FROM core_column WHERE id = $1::uuid", card["column_id"]) or "").strip()
+        to_col_name = (await conn.fetchval("SELECT name FROM core_column WHERE id = $1::uuid", str(to_column_id)) or "").strip()
+
+        if role == "executor":
+            allowed = await _can_executor_work_with_card(conn, user_id, card_id)
+            if not allowed:
+                raise HTTPException(status_code=403, detail="executor_card_forbidden")
+            allowed_transitions = {
+                (WORKFLOW_TODO_COLUMN_NAME, WORKFLOW_IN_PROGRESS_COLUMN_NAME),
+                (WORKFLOW_IN_PROGRESS_COLUMN_NAME, WORKFLOW_REVIEW_COLUMN_NAME),
+            }
+            if str(card["column_id"]) != str(to_column_id) and (from_col_name, to_col_name) not in allowed_transitions:
+                raise HTTPException(status_code=403, detail="executor_transition_forbidden")
 
         wip_err = await _validate_wip(conn, str(card["board_id"]), str(to_column_id), card_id, str(space["organization_id"]))
         if wip_err:
@@ -1591,8 +1718,6 @@ async def card_move(
             now,
         )
         await ensure_notifications_table(conn=conn)
-        from_col_name = await conn.fetchval("SELECT name FROM core_column WHERE id = $1::uuid", from_column_id)
-        to_col_name = await conn.fetchval("SELECT name FROM core_column WHERE id = $1::uuid", to_column_id)
         card_title = await conn.fetchval("SELECT title FROM core_card WHERE id = $1::uuid", card_id)
         await create_notification_for_org_members(
             conn=conn,
@@ -1806,6 +1931,206 @@ async def card_detail(
             out["unread_comments_count"] = int(unread_count or 0)
     if not out:
         raise HTTPException(status_code=404, detail="Карточка не найдена")
+    return out
+
+
+async def _blocked_seconds_for_card(conn: asyncpg.Connection, card_id: str, ended_at: datetime) -> float:
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT created_at, resolved_at, is_resolved
+            FROM core_cardblock
+            WHERE card_id = $1::uuid
+            """,
+            card_id,
+        )
+    except Exception:
+        return 0.0
+    total = 0.0
+    for row in rows:
+        started = row["created_at"]
+        if started is None:
+            continue
+        if getattr(started, "tzinfo", None) is None:
+            started = started.replace(tzinfo=timezone.utc)
+        finished = row["resolved_at"] if row["is_resolved"] else ended_at
+        if finished is None:
+            finished = ended_at
+        if getattr(finished, "tzinfo", None) is None:
+            finished = finished.replace(tzinfo=timezone.utc)
+        if finished > started:
+            total += (finished - started).total_seconds()
+    return max(total, 0.0)
+
+
+@router.post("/cards/{card_id}/archive")
+async def archive_card(
+    request: Request,
+    card_id: str,
+    user_id: str = Depends(require_authenticated_user_id),
+    _: None = Depends(require_space_access),
+    _role: str = Depends(require_manager_role),
+) -> dict[str, Any]:
+    """Архивировать карточку и сохранить трудозатраты.
+
+    Доступ: manager/admin. Карточка должна быть в колонке «Выполнено».
+    Формула: (архивация - старт карточки) - время блокировок.
+    """
+    if not state.pg_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    async with state.pg_pool.acquire() as conn:
+        card = await conn.fetchrow(
+            """
+            SELECT c.id, c.title, c.created_at, c.planned_start_at, c.column_id, c.board_id, b.space_id
+            FROM core_card c
+            JOIN core_board b ON b.id = c.board_id
+            JOIN core_space s ON s.id = b.space_id
+            JOIN core_organizationmember om ON om.organization_id = s.organization_id
+            WHERE c.id = $1::uuid AND om.user_id = $2::uuid
+            LIMIT 1
+            """,
+            card_id,
+            user_id,
+        )
+        if not card:
+            raise HTTPException(status_code=404, detail="Карточка не найдена")
+        active_space_id = request.headers.get("x-space-id")
+        if active_space_id and str(card["space_id"]) != active_space_id:
+            raise HTTPException(status_code=403, detail="Карточка вне активного space")
+
+        column_name = await conn.fetchval("SELECT name FROM core_column WHERE id = $1::uuid", str(card["column_id"]))
+        if (column_name or "").strip() != WORKFLOW_DONE_COLUMN_NAME:
+            raise HTTPException(status_code=400, detail="archive_allowed_only_from_done")
+
+        archived_at = datetime.now(timezone.utc)
+        started_at = card["planned_start_at"] or card["created_at"] or archived_at
+        if getattr(started_at, "tzinfo", None) is None:
+            started_at = started_at.replace(tzinfo=timezone.utc)
+        gross_seconds = max((archived_at - started_at).total_seconds(), 0.0)
+        blocked_seconds = await _blocked_seconds_for_card(conn, card_id, archived_at)
+        total_effort_seconds = max(gross_seconds - blocked_seconds, 0.0)
+
+        await _upsert_card_field_value_by_key(
+            conn,
+            card_id=card_id,
+            space_id=str(card["space_id"]),
+            key=ARCHIVED_FIELD_KEY,
+            name="В архиве",
+            value=True,
+            field_type="json",
+        )
+        await _upsert_card_field_value_by_key(
+            conn,
+            card_id=card_id,
+            space_id=str(card["space_id"]),
+            key=ARCHIVED_AT_FIELD_KEY,
+            name="Дата архивации",
+            value=archived_at.isoformat(),
+            field_type="text",
+        )
+        await _upsert_card_field_value_by_key(
+            conn,
+            card_id=card_id,
+            space_id=str(card["space_id"]),
+            key=ARCHIVED_EFFORT_SECONDS_FIELD_KEY,
+            name="Трудозатраты (сек)",
+            value=round(total_effort_seconds, 1),
+            field_type="number",
+        )
+    return {
+        "ok": True,
+        "card_id": card_id,
+        "archived_at": archived_at.isoformat(),
+        "total_effort_seconds": round(total_effort_seconds, 1),
+    }
+
+
+@router.get("/boards/{board_id}/archive")
+async def board_archive_list(
+    board_id: str,
+    user_id: str = Depends(require_authenticated_user_id),
+) -> list[dict[str, Any]]:
+    """Список архивных карточек доски с рассчитанными трудозатратами."""
+    if not state.pg_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    async with state.pg_pool.acquire() as conn:
+        role_row = await conn.fetchrow(
+            """
+            SELECT s.organization_id
+            FROM core_board b
+            JOIN core_space s ON s.id = b.space_id
+            JOIN core_organizationmember om ON om.organization_id = s.organization_id
+            WHERE b.id = $1::uuid AND om.user_id = $2::uuid
+            LIMIT 1
+            """,
+            board_id,
+            user_id,
+        )
+        if not role_row:
+            return []
+        role = await get_effective_role(user_id, str(role_row["organization_id"]))
+        if role == "executor":
+            return []
+
+        rows = await conn.fetch(
+            """
+            SELECT c.id::text AS id, c.title, b.name AS board_name, col.name AS column_name
+            FROM core_card c
+            JOIN core_board b ON b.id = c.board_id
+            JOIN core_column col ON col.id = c.column_id
+            WHERE c.board_id = $1::uuid
+            ORDER BY c.updated_at DESC
+            """,
+            board_id,
+        )
+        if not rows:
+            return []
+        card_ids = [r["id"] for r in rows]
+        field_rows = await conn.fetch(
+            """
+            SELECT fv.card_id::text AS card_id, fd.key, fv.value
+            FROM core_cardfieldvalue fv
+            JOIN core_cardfielddefinition fd ON fd.id = fv.definition_id
+            WHERE fv.card_id = ANY($1::uuid[])
+              AND fd.key IN ($2, $3, $4)
+            """,
+            card_ids,
+            ARCHIVED_FIELD_KEY,
+            ARCHIVED_AT_FIELD_KEY,
+            ARCHIVED_EFFORT_SECONDS_FIELD_KEY,
+        )
+        by_card: dict[str, dict[str, Any]] = {}
+        for fr in field_rows:
+            cid = str(fr["card_id"])
+            meta = by_card.setdefault(cid, {})
+            k = str(fr["key"] or "")
+            v = fr["value"]
+            if k == ARCHIVED_FIELD_KEY:
+                meta["is_archived"] = _jsonish_bool(v)
+            elif k == ARCHIVED_AT_FIELD_KEY:
+                meta["archived_at"] = str(v).strip() if v is not None else None
+            elif k == ARCHIVED_EFFORT_SECONDS_FIELD_KEY:
+                try:
+                    meta["total_effort_seconds"] = float(v)
+                except Exception:
+                    meta["total_effort_seconds"] = 0.0
+
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            cid = str(r["id"])
+            meta = by_card.get(cid, {})
+            if not _jsonish_bool(meta.get("is_archived")):
+                continue
+            out.append(
+                {
+                    "id": cid,
+                    "title": (r["title"] or "").strip() or "—",
+                    "board_name": (r["board_name"] or "").strip(),
+                    "column_name": (r["column_name"] or "").strip(),
+                    "archived_at": meta.get("archived_at"),
+                    "total_effort_seconds": round(float(meta.get("total_effort_seconds") or 0.0), 1),
+                }
+            )
     return out
 
 
@@ -2528,16 +2853,27 @@ async def create_card(
 
     if not title:
         raise HTTPException(status_code=400, detail="title required")
-    if not column_id:
-        raise HTTPException(status_code=400, detail="column_id required")
-
     async with state.pg_pool.acquire() as conn:
-        if not board_id:
+        if not board_id and column_id:
             col_row = await conn.fetchrow("SELECT board_id FROM core_column WHERE id = $1::uuid", column_id)
             if col_row:
                 board_id = str(col_row["board_id"])
         if not board_id:
             raise HTTPException(status_code=400, detail="board_id required or column not found")
+        await _ensure_board_workflow(conn, str(board_id))
+        backlog_column_id = await conn.fetchval(
+            """
+            SELECT id FROM core_column
+            WHERE board_id = $1::uuid AND name = $2
+            ORDER BY order_index
+            LIMIT 1
+            """,
+            board_id,
+            DEFAULT_BACKLOG_COLUMN_NAME,
+        )
+        if not backlog_column_id:
+            raise HTTPException(status_code=400, detail="backlog_column_not_found")
+        column_id = str(backlog_column_id)
 
         track_uuid: str | None = None
         if track_id_raw:
@@ -2649,13 +2985,24 @@ async def assign_card_executor(
         if not card:
             raise HTTPException(status_code=404, detail="Карточка не найдена")
         exists = await conn.fetchrow(
-            "SELECT 1 FROM core_organizationmember WHERE organization_id = $1::uuid AND user_id = $2::uuid LIMIT 1",
+            "SELECT role FROM core_organizationmember WHERE organization_id = $1::uuid AND user_id = $2::uuid LIMIT 1",
             str(card["organization_id"]),
             str(assignee_user_id),
         )
         if not exists:
             raise HTTPException(status_code=400, detail="user_not_in_organization")
+        assignee_role = str(exists["role"] or "").strip().lower()
+        if assignee_role != "executor":
+            raise HTTPException(status_code=400, detail="assignee_must_be_executor")
+        assignee_row = await conn.fetchrow(
+            "SELECT full_name, email FROM core_user WHERE id = $1::uuid",
+            str(assignee_user_id),
+        )
+        assignee_name = (assignee_row["full_name"] or "").strip() if assignee_row else ""
+        if not assignee_name and assignee_row:
+            assignee_name = (assignee_row["email"] or "").strip()
         now = datetime.now(timezone.utc)
+        await conn.execute("DELETE FROM core_cardassignment WHERE card_id = $1::uuid", card_id)
         await conn.execute(
             """
             INSERT INTO core_cardassignment (id, card_id, user_id, assigned_by_id, assigned_at)
@@ -2668,6 +3015,41 @@ async def assign_card_executor(
             str(assignee_user_id),
             user_id,
             now,
+        )
+        todo_column_id = await conn.fetchval(
+            """
+            SELECT id FROM core_column
+            WHERE board_id = $1::uuid AND name = $2
+            ORDER BY order_index
+            LIMIT 1
+            """,
+            str(card["board_id"]),
+            WORKFLOW_TODO_COLUMN_NAME,
+        )
+        if todo_column_id:
+            await conn.execute(
+                "UPDATE core_card SET column_id = $1::uuid, updated_at = $2 WHERE id = $3::uuid",
+                str(todo_column_id),
+                now,
+                card_id,
+            )
+        await _upsert_card_field_value_by_key(
+            conn,
+            card_id=card_id,
+            space_id=str(card["space_id"]),
+            key="assignee_user_id",
+            name="Ответственный (ID)",
+            value=str(assignee_user_id),
+            field_type="text",
+        )
+        await _upsert_card_field_value_by_key(
+            conn,
+            card_id=card_id,
+            space_id=str(card["space_id"]),
+            key="assignee_name",
+            name="Ответственный",
+            value=assignee_name,
+            field_type="text",
         )
     return {"ok": True, "card_id": card_id, "user_id": str(assignee_user_id)}
 

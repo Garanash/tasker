@@ -1,9 +1,12 @@
 "use client";
 
 import { useEffect, useMemo, useState, useCallback, useRef } from "react";
-import { useSearchParams } from "next/navigation";
-import { useTheme } from "@mui/material";
-import { getApiUrl } from "@/lib/api";
+import Image from "next/image";
+import { useSearchParams, useRouter } from "next/navigation";
+import { Button, IconButton, useTheme } from "@mui/material";
+import LightModeOutlinedIcon from "@mui/icons-material/LightModeOutlined";
+import DarkModeOutlinedIcon from "@mui/icons-material/DarkModeOutlined";
+import { getApiUrl, getWsUrl } from "@/lib/api";
 import { KanbanBoard, type KanbanFilters } from "../../components/kanban/KanbanBoard";
 import AppShell, { type AppNotification, type AppRole, type ViewMode } from "../../components/kaiten/AppShell";
 import FiltersPopover from "../../components/kaiten/FiltersPopover";
@@ -12,11 +15,20 @@ import TableView from "../../components/views/TableView";
 import TimelineView from "../../components/views/TimelineView";
 import CalendarView from "../../components/views/CalendarView";
 import CreateSpaceDialog from "../../components/dialogs/CreateSpaceDialog";
+import CreateBoardDialog from "../../components/dialogs/CreateBoardDialog";
 import CreateTaskDialog from "../../components/dialogs/CreateTaskDialog";
 import CreateFolderDialog from "../../components/dialogs/CreateFolderDialog";
 import ProfileSettingsDialog from "../../components/dialogs/ProfileSettingsDialog";
+import DirectMessageDrawer, { type DmPeer } from "../../components/dialogs/DirectMessageDrawer";
 import { CardModal, type CardDetail } from "../../components/kanban/CardModal";
-import { getStoredLanguage, getStoredTheme, type AppLanguage } from "@/lib/preferences";
+import {
+  getStoredLanguage,
+  getStoredTheme,
+  setStoredLanguage,
+  setStoredTheme,
+  type AppLanguage,
+} from "@/lib/preferences";
+import { randomId } from "@/lib/randomId";
 import type { ColorTheme } from "../../components/kaiten/ProfileMenu";
 
 type AuthToken = { access: string; refresh?: string };
@@ -24,6 +36,7 @@ const ACCESS_STORAGE_KEY = "kaiten_access";
 const REFRESH_STORAGE_KEY = "kaiten_refresh";
 const ONBOARDING_TOUR_STORAGE_KEY = "kaiten_onboarding_tour_seen";
 const LAST_ACTIVE_SPACE_STORAGE_KEY = "kaiten_last_active_space_id";
+const LAST_ACTIVE_ORG_STORAGE_KEY = "kaiten_last_active_org_id";
 
 type Space = { id: string; name: string; organization_id: string };
 type Project = { id: string; name: string; space_id: string };
@@ -32,8 +45,11 @@ type OrgUser = {
   id: string;
   email: string;
   full_name: string;
-  role: "user" | "executor" | "manager" | "lead" | "admin";
+  role: AppRole;
   last_login?: string | null;
+  avatar_url?: string;
+  /** Все членства, видимые вызывающему admin (как в GET /users/{id}/memberships). */
+  memberships?: Array<{ organization_id: string; organization_name: string; role: string }>;
 };
 type CurrentUserMe = {
   user: { id: string; email: string; full_name: string; avatar_url?: string };
@@ -58,6 +74,7 @@ type Card = {
   blocked_count?: number;
   blocking_count?: number;
   is_favorite?: boolean;
+  estimate_points?: number | null;
 };
 
 type BoardGrid = {
@@ -65,6 +82,24 @@ type BoardGrid = {
   tracks: Array<{ id: string; name: string }>;
   columns: Array<Column & { cards: Card[] }>;
 };
+type ArchivedCardItem = {
+  id: string;
+  title: string;
+  board_name: string;
+  column_name: string;
+  archived_at?: string | null;
+  total_effort_seconds?: number;
+};
+
+function formatEffortSeconds(seconds: number | undefined, language: AppLanguage): string {
+  const safe = Math.max(0, Math.round(Number(seconds || 0)));
+  const h = Math.floor(safe / 3600);
+  const m = Math.floor((safe % 3600) / 60);
+  const s = safe % 60;
+  if (h > 0) return `${h}ч ${m}м`;
+  if (m > 0) return `${m}м ${s}с`;
+  return language === "en" ? `${s}s` : `${s}с`;
+}
 
 type DocumentMini = { id: string; title: string; doc_type: string; updated_at: string };
 type DocumentDetail = {
@@ -90,7 +125,7 @@ function parseDocumentContent(raw: string): { icon: string; blocks: DocBlock[] }
     if (data && Array.isArray(data.blocks)) {
       const blocks = data.blocks
         .map((b: any) => ({
-          id: String(b.id || crypto.randomUUID()),
+          id: String(b.id || randomId()),
           type:
             b.type === "comment" ||
             b.type === "heading" ||
@@ -108,7 +143,7 @@ function parseDocumentContent(raw: string): { icon: string; blocks: DocBlock[] }
         .filter((b: DocBlock) => b.content.length > 0 || b.type === "text" || b.type === "todo" || b.type === "divider");
       return {
         icon: typeof data.icon === "string" ? data.icon : "",
-        blocks: blocks.length ? blocks : [{ id: crypto.randomUUID(), type: "text", content: "" }],
+        blocks: blocks.length ? blocks : [{ id: randomId(), type: "text", content: "" }],
       };
     }
   } catch {
@@ -116,7 +151,7 @@ function parseDocumentContent(raw: string): { icon: string; blocks: DocBlock[] }
   }
   return {
     icon: "",
-    blocks: [{ id: crypto.randomUUID(), type: "text", content: raw || "" }],
+    blocks: [{ id: randomId(), type: "text", content: raw || "" }],
   };
 }
 
@@ -125,6 +160,65 @@ function serializeDocumentContent(icon: string, blocks: DocBlock[]): string {
     icon,
     blocks: blocks.map((b) => ({ id: b.id, type: b.type, content: b.content, checked: b.checked ?? false })),
   });
+}
+
+/** Сравнение UUID организаций без учёта регистра (localStorage / разные источники). */
+function normalizeOrgIdKey(id: string | null | undefined): string {
+  return (id || "").trim().toLowerCase();
+}
+
+function normalizeOrgDisplayName(name: string | null | undefined): string {
+  return (name || "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/** Основная рабочая организация: при автоматическом выборе — после last space / localStorage. */
+function isAlmazgeoburOrganizationName(name: string | null | undefined): boolean {
+  const k = normalizeOrgDisplayName(name);
+  return (
+    k === "almazgeobur" ||
+    k === "алмазгеобур" ||
+    k.includes("almazgeobur") ||
+    k.includes("алмазгеобур")
+  );
+}
+
+function formatOrgMemberRoleLabel(role: string, lang: AppLanguage): string {
+  const r = (role || "executor").toLowerCase();
+  if (lang === "en") {
+    if (r === "admin") return "Admin";
+    if (r === "manager") return "Manager";
+    if (r === "executor") return "Executor";
+    return "Executor";
+  }
+  if (r === "admin") return "Администратор";
+  if (r === "manager") return "Менеджер";
+  if (r === "executor") return "Исполнитель";
+  return "Исполнитель";
+}
+
+function normalizeOrgUserFromApi(raw: any): OrgUser {
+  const mraw = raw?.memberships;
+  const memberships: NonNullable<OrgUser["memberships"]> = [];
+  if (Array.isArray(mraw)) {
+    for (const x of mraw) {
+      const oid = String(x?.organization_id ?? x?.organizationId ?? "").trim();
+      if (!oid) continue;
+      memberships.push({
+        organization_id: oid,
+        organization_name: String(x?.organization_name ?? x?.organizationName ?? "").trim(),
+        role: String(x?.role ?? "executor"),
+      });
+    }
+  }
+  return {
+    id: String(raw?.id ?? ""),
+    email: String(raw?.email ?? ""),
+    full_name: String(raw?.full_name ?? ""),
+    role: (raw?.role as OrgUser["role"]) ?? "executor",
+    last_login: raw?.last_login ?? null,
+    avatar_url: raw?.avatar_url ? String(raw.avatar_url) : undefined,
+    memberships: memberships.length > 0 ? memberships : undefined,
+  };
 }
 
 /** Только чтение: режим просмотра документа */
@@ -255,6 +349,76 @@ function GreyButton({
   );
 }
 
+/** Как в шапке AppShell: язык — флаг + название, тема — переключение иконкой светлая/тёмная */
+function AuthScreenControls({
+  language,
+  onLanguage,
+  onTheme,
+}: {
+  language: AppLanguage;
+  onLanguage: (l: AppLanguage) => void;
+  onTheme: (t: ColorTheme) => void;
+}) {
+  const muiTheme = useTheme();
+  const isDarkTheme = muiTheme.palette.mode === "dark";
+  const languageLabel = language === "ru" ? "🇷🇺 Русский" : "🇬🇧 English";
+  const languageTitle = language === "ru" ? "Switch to English" : "Переключить на русский";
+  const themeTitle =
+    language === "en"
+      ? isDarkTheme
+        ? "Dark theme"
+        : "Light theme"
+      : isDarkTheme
+        ? "Тёмная"
+        : "Светлая";
+
+  return (
+    <div className="pointer-events-none fixed inset-x-0 top-0 z-[90] flex justify-end p-3 sm:p-4">
+      <div className="pointer-events-auto flex flex-wrap items-center justify-end gap-1">
+        <Button
+          type="button"
+          id="auth-localization-select-trigger"
+          onClick={() => onLanguage(language === "ru" ? "en" : "ru")}
+          title={languageTitle}
+          sx={{
+            textTransform: "none",
+            minWidth: "auto",
+            px: 1.25,
+            py: 0.5,
+            borderRadius: 1.5,
+            color: "var(--k-text)",
+            fontSize: 13,
+            fontWeight: 500,
+            border: "1px solid var(--k-border)",
+            bgcolor: "var(--k-surface-bg)",
+            "&:hover": { bgcolor: "var(--k-hover)", color: "var(--k-text)" },
+          }}
+        >
+          {languageLabel}
+        </Button>
+        <IconButton
+          type="button"
+          onClick={() => {
+            const nextTheme: ColorTheme = isDarkTheme ? "light" : "dark";
+            onTheme(nextTheme);
+          }}
+          title={themeTitle}
+          aria-label={themeTitle}
+          sx={{
+            borderRadius: 1.5,
+            color: "var(--k-text)",
+            border: "1px solid var(--k-border)",
+            bgcolor: "var(--k-surface-bg)",
+            "&:hover": { bgcolor: "var(--k-hover)", color: "var(--k-text)" },
+          }}
+        >
+          {isDarkTheme ? <DarkModeOutlinedIcon fontSize="small" /> : <LightModeOutlinedIcon fontSize="small" />}
+        </IconButton>
+      </div>
+    </div>
+  );
+}
+
 export default function AppHomePageImplGray() {
   const muiTheme = useTheme();
   const isDarkTheme = muiTheme.palette.mode === "dark";
@@ -271,6 +435,7 @@ export default function AppHomePageImplGray() {
   );
   const [token, setToken] = useState<AuthToken | null>(null);
   const [activeSpaceId, setActiveSpaceId] = useState<string | null>(null);
+  const [activeOrganizationId, setActiveOrganizationId] = useState<string | null>(null);
   const [spaces, setSpaces] = useState<Space[]>([]);
 
   const [boards, setBoards] = useState<Board[]>([]);
@@ -278,12 +443,22 @@ export default function AppHomePageImplGray() {
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [activeBoardId, setActiveBoardId] = useState<string | null>(null);
   const searchParams = useSearchParams();
+  const router = useRouter();
+  const deepLinkCardHandledRef = useRef<string | null>(null);
 
   const [kaitenTab, setKaitenTab] = useState<string>("lists");
   const [viewMode, setViewMode] = useState<ViewMode>("board");
 
-  const [filters, setFilters] = useState<KanbanFilters>({ query: "", titleOnly: false, status: "all" });
+  const [filters, setFilters] = useState<KanbanFilters>({
+    query: "",
+    titleOnly: false,
+    status: "all",
+    assigneeUserId: null,
+    priority: "all",
+    due: "all",
+  });
   const [filtersAnchorEl, setFiltersAnchorEl] = useState<HTMLElement | null>(null);
+  const [filterAssigneeOptions, setFilterAssigneeOptions] = useState<Array<{ id: string; label: string }>>([]);
 
   const [boardGrid, setBoardGrid] = useState<BoardGrid | null>(null);
   const [allCards, setAllCards] = useState<Card[]>([]);
@@ -297,6 +472,8 @@ export default function AppHomePageImplGray() {
     return col;
   }, [searchParams, activeBoardId]);
 
+  const recoverTokenParam = searchParams.get("recover");
+
   const [docs, setDocs] = useState<DocumentMini[]>([]);
   const [selectedDoc, setSelectedDoc] = useState<DocumentDetail | null>(null);
   const [docsLoading, setDocsLoading] = useState(false);
@@ -304,7 +481,7 @@ export default function AppHomePageImplGray() {
 
   const [createBusy, setCreateBusy] = useState(false);
   const [docIcon, setDocIcon] = useState("");
-  const [docBlocks, setDocBlocks] = useState<DocBlock[]>([{ id: crypto.randomUUID(), type: "text", content: "" }]);
+  const [docBlocks, setDocBlocks] = useState<DocBlock[]>([{ id: randomId(), type: "text", content: "" }]);
   const [docSaveBusy, setDocSaveBusy] = useState(false);
   const [newDocBlockType, setNewDocBlockType] = useState<DocBlock["type"]>("text");
   const [docIconPickerOpen, setDocIconPickerOpen] = useState(false);
@@ -319,21 +496,36 @@ export default function AppHomePageImplGray() {
   const [docImmersiveMode, setDocImmersiveMode] = useState(false);
   const [docViewMode, setDocViewMode] = useState<"edit" | "preview">("edit");
 
-  const [mode, setMode] = useState<"login" | "register">("register");
   const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [orgName, setOrgName] = useState("");
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
-  const [loginMethod, setLoginMethod] = useState<"password" | "code">("password");
+  const [authNotice, setAuthNotice] = useState<string | null>(null);
   const [otpCode, setOtpCode] = useState("");
+  const [recoverNewPassword, setRecoverNewPassword] = useState("");
+  const [recoverConfirmPassword, setRecoverConfirmPassword] = useState("");
+  const [recoverBusy, setRecoverBusy] = useState(false);
+  const [requestLoginCodeBusy, setRequestLoginCodeBusy] = useState(false);
+  const [requestLoginCodeMsg, setRequestLoginCodeMsg] = useState<string | null>(null);
   const [adminEditUser, setAdminEditUser] = useState<OrgUser | null>(null);
   const [adminEditFullName, setAdminEditFullName] = useState("");
   const [adminEditEmail, setAdminEditEmail] = useState("");
   const [adminEditBusy, setAdminEditBusy] = useState(false);
+  const [adminUserMemberships, setAdminUserMemberships] = useState<
+    Array<{ organization_id: string; organization_name: string; role: OrgUser["role"] }>
+  >([]);
+  const [adminMembershipsLoading, setAdminMembershipsLoading] = useState(false);
+  const [adminAddMembershipOrgId, setAdminAddMembershipOrgId] = useState("");
+  const [adminAddMembershipRole, setAdminAddMembershipRole] = useState<OrgUser["role"]>("executor");
+  const [adminAddMembershipBusy, setAdminAddMembershipBusy] = useState(false);
+  const [adminMembershipRoleBusyOrgId, setAdminMembershipRoleBusyOrgId] = useState<string | null>(null);
   const [userCodeBusyId, setUserCodeBusyId] = useState<string | null>(null);
+  const [userDeleteBusyId, setUserDeleteBusyId] = useState<string | null>(null);
+  const [createBsvrOrgBusy, setCreateBsvrOrgBusy] = useState(false);
+  const [archiveCards, setArchiveCards] = useState<ArchivedCardItem[]>([]);
+  const [archiveLoading, setArchiveLoading] = useState(false);
 
   const [createSpaceOpen, setCreateSpaceOpen] = useState(false);
+  const [createBoardOpen, setCreateBoardOpen] = useState(false);
   const [createFolderOpen, setCreateFolderOpen] = useState(false);
   const [createTaskOpen, setCreateTaskOpen] = useState(false);
   const [createTaskColumnId, setCreateTaskColumnId] = useState<string | null>(null);
@@ -343,33 +535,214 @@ export default function AppHomePageImplGray() {
   const [selectedCard, setSelectedCard] = useState<CardDetail | null>(null);
   const [selectedCardError, setSelectedCardError] = useState<string | null>(null);
   const [orgUsers, setOrgUsers] = useState<OrgUser[]>([]);
+  const [sidebarOrgMembers, setSidebarOrgMembers] = useState<
+    Array<{ id: string; full_name: string; email: string; avatar_url?: string; role: string }>
+  >([]);
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
+  const [dmPeer, setDmPeer] = useState<DmPeer | null>(null);
+  const [sidebarOrgMembersLoading, setSidebarOrgMembersLoading] = useState(false);
   const [orgUsersLoading, setOrgUsersLoading] = useState(false);
   const [orgUsersError, setOrgUsersError] = useState<string | null>(null);
   const [orgUsersSuccess, setOrgUsersSuccess] = useState<string | null>(null);
   const [newUserEmail, setNewUserEmail] = useState("");
   const [newUserPassword, setNewUserPassword] = useState("");
   const [newUserFullName, setNewUserFullName] = useState("");
-  const [newUserRole, setNewUserRole] = useState<OrgUser["role"]>("user");
+  const [newUserRole, setNewUserRole] = useState<OrgUser["role"]>("executor");
   const [newUserBusy, setNewUserBusy] = useState(false);
-  const [effectiveRole, setEffectiveRole] = useState<AppRole>("user");
-  const [orgMemberships, setOrgMemberships] = useState<Array<{ organization_id: string; role: AppRole }>>([]);
+  const [newUserOrganizationId, setNewUserOrganizationId] = useState<string | null>(null);
+  const [orgMemberships, setOrgMemberships] = useState<
+    Array<{ organization_id: string; role: AppRole; organization_name: string }>
+  >([]);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [unreadNotificationsCount, setUnreadNotificationsCount] = useState(0);
+  const [dmUnreadCount, setDmUnreadCount] = useState(0);
   const [tourOpen, setTourOpen] = useState(false);
   const [profileFullName, setProfileFullName] = useState("");
   const [profileAvatarUrl, setProfileAvatarUrl] = useState("");
   const [profileDialogOpen, setProfileDialogOpen] = useState(false);
 
+  /** После первого завершения /api/auth/me — иначе нельзя угадывать org по spaces[0] (порядок ≠ «моя» организация). */
+  const profileMeLoadedRef = useRef(false);
+
   const access = token?.access;
-  const canManageBoard = effectiveRole !== "user" && effectiveRole !== "executor";
+
+  const effectiveRole = useMemo((): AppRole => {
+    if (!activeOrganizationId) return "executor";
+    const key = normalizeOrgIdKey(activeOrganizationId);
+    const m = orgMemberships.find((x) => normalizeOrgIdKey(x.organization_id) === key);
+    return (m?.role as AppRole) ?? "executor";
+  }, [activeOrganizationId, orgMemberships]);
+
+  const canManageBoard = effectiveRole === "manager" || effectiveRole === "admin";
   const isAdmin = effectiveRole === "admin";
   const canManageCurrentSpace = useMemo(() => {
-    if (!activeSpaceId) return false;
+    if (!activeSpaceId || !activeOrganizationId) return false;
     const activeSpace = spaces.find((space) => space.id === activeSpaceId);
-    if (!activeSpace?.organization_id) return false;
-    const membership = orgMemberships.find((m) => m.organization_id === activeSpace.organization_id);
-    return membership?.role === "lead" || membership?.role === "admin";
-  }, [activeSpaceId, spaces, orgMemberships]);
+    if (!activeSpace?.organization_id || normalizeOrgIdKey(activeSpace.organization_id) !== normalizeOrgIdKey(activeOrganizationId))
+      return false;
+    const membership = orgMemberships.find((m) => normalizeOrgIdKey(m.organization_id) === normalizeOrgIdKey(activeOrganizationId));
+    return membership?.role === "manager" || membership?.role === "admin";
+  }, [activeSpaceId, spaces, orgMemberships, activeOrganizationId]);
+
+  const visibleSpaces = useMemo(() => {
+    if (!activeOrganizationId) return spaces;
+    const key = normalizeOrgIdKey(activeOrganizationId);
+    return spaces.filter((s) => normalizeOrgIdKey(s.organization_id) === key);
+  }, [spaces, activeOrganizationId]);
+
+  const visibleBoards = useMemo(() => {
+    if (!activeOrganizationId) return boards;
+    const key = normalizeOrgIdKey(activeOrganizationId);
+    const spaceIds = new Set(spaces.filter((s) => normalizeOrgIdKey(s.organization_id) === key).map((s) => s.id));
+    return boards.filter((b) => !b.space_id || spaceIds.has(b.space_id));
+  }, [boards, spaces, activeOrganizationId]);
+
+  const visibleProjects = useMemo(() => {
+    if (!activeOrganizationId) return projects;
+    const key = normalizeOrgIdKey(activeOrganizationId);
+    const spaceIds = new Set(spaces.filter((s) => normalizeOrgIdKey(s.organization_id) === key).map((s) => s.id));
+    return projects.filter((p) => spaceIds.has(p.space_id));
+  }, [projects, spaces, activeOrganizationId]);
+
+  const sidebarOrganizations = useMemo(
+    () =>
+      orgMemberships.map((m) => ({
+        id: m.organization_id,
+        name: m.organization_name || m.organization_id.slice(0, 8),
+      })),
+    [orgMemberships],
+  );
+
+  const activeOrganizationName = useMemo(() => {
+    if (!activeOrganizationId) return "";
+    const key = normalizeOrgIdKey(activeOrganizationId);
+    const m = orgMemberships.find((x) => normalizeOrgIdKey(x.organization_id) === key);
+    return (m?.organization_name || "").trim() || activeOrganizationId;
+  }, [activeOrganizationId, orgMemberships]);
+
+  const adminOrganizations = useMemo(() => orgMemberships.filter((m) => m.role === "admin"), [orgMemberships]);
+
+  const orgsAvailableToAddForAdminEdit = useMemo(() => {
+    const membershipOrgKeys = new Set(adminUserMemberships.map((m) => normalizeOrgIdKey(m.organization_id)));
+    return adminOrganizations.filter((o) => !membershipOrgKeys.has(normalizeOrgIdKey(o.organization_id)));
+  }, [adminUserMemberships, adminOrganizations]);
+
+  const hasBsvrOrganization = useMemo(
+    () => adminOrganizations.some((m) => (m.organization_name || "").trim() === "БСВР"),
+    [adminOrganizations],
+  );
+
+  useEffect(() => {
+    if (!adminOrganizations.length) {
+      setNewUserOrganizationId(null);
+      return;
+    }
+    if (adminOrganizations.length === 1) {
+      setNewUserOrganizationId(adminOrganizations[0].organization_id);
+      return;
+    }
+    setNewUserOrganizationId((prev) => {
+      if (prev && adminOrganizations.some((m) => m.organization_id === prev)) return prev;
+      if (activeOrganizationId && adminOrganizations.some((m) => m.organization_id === activeOrganizationId))
+        return activeOrganizationId;
+      return adminOrganizations[0].organization_id;
+    });
+  }, [adminOrganizations, activeOrganizationId]);
+
+  useEffect(() => {
+    if (!adminEditUser) {
+      setAdminUserMemberships([]);
+      setAdminMembershipsLoading(false);
+      setAdminAddMembershipOrgId("");
+      return;
+    }
+    if (!token?.access || !activeOrganizationId) {
+      setAdminMembershipsLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setAdminMembershipsLoading(true);
+    (async () => {
+      try {
+        const res = await fetch(getApiUrl(`/api/auth/users/${adminEditUser.id}/memberships`), {
+          headers: {
+            Authorization: `Bearer ${token.access}`,
+            "X-Organization-Id": activeOrganizationId,
+            ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
+          },
+        });
+        const data = (await res.json().catch(() => ({}))) as { detail?: string } | unknown[];
+        if (!res.ok) {
+          const msg =
+            typeof (data as { detail?: string })?.detail === "string"
+              ? (data as { detail: string }).detail
+              : "Не удалось загрузить организации пользователя";
+          throw new Error(msg);
+        }
+        const list = Array.isArray(data)
+          ? (data as Array<{ organization_id: string; organization_name: string; role: string }>)
+          : [];
+        if (!cancelled) {
+          setAdminUserMemberships(
+            list.map((x) => ({
+              organization_id: x.organization_id,
+              organization_name: x.organization_name,
+              role: (x.role as OrgUser["role"]) ?? "executor",
+            })),
+          );
+        }
+      } catch {
+        if (!cancelled) setAdminUserMemberships([]);
+      } finally {
+        if (!cancelled) setAdminMembershipsLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [adminEditUser, token?.access, activeOrganizationId, activeSpaceId]);
+
+  useEffect(() => {
+    if (!adminEditUser) {
+      setAdminAddMembershipOrgId("");
+      return;
+    }
+    const available = orgsAvailableToAddForAdminEdit;
+    setAdminAddMembershipOrgId((prev) => {
+      if (available.length === 0) return "";
+      const ok =
+        prev &&
+        available.some((o) => normalizeOrgIdKey(o.organization_id) === normalizeOrgIdKey(prev));
+      return ok ? prev : available[0].organization_id;
+    });
+  }, [adminEditUser?.id, orgsAvailableToAddForAdminEdit]);
+
+  const handleRenameOrganization = useCallback(async (organizationId: string, newName: string): Promise<boolean> => {
+    if (!token?.access) return false;
+    try {
+      const res = await fetch(getApiUrl(`/api/auth/organizations/${organizationId}`), {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${token.access}`,
+          "Content-Type": "application/json",
+          "X-Organization-Id": organizationId,
+        },
+        body: JSON.stringify({ name: newName }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(typeof data?.detail === "string" ? data.detail : "Не удалось переименовать");
+      }
+      setOrgMemberships((prev) =>
+        prev.map((m) => (m.organization_id === organizationId ? { ...m, organization_name: newName } : m)),
+      );
+      return true;
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Ошибка переименования организации";
+      setAuthError(msg);
+      return false;
+    }
+  }, [token?.access]);
 
   const displayUserName = useMemo(
     () => profileFullName.trim() || email.split("@")[0] || "Пользователь",
@@ -412,6 +785,7 @@ export default function AppHomePageImplGray() {
     if (!token?.refresh) {
       setToken(null);
       setActiveSpaceId(null);
+      setActiveOrganizationId(null);
       setActiveProjectId(null);
       setActiveBoardId(null);
       localStorage.removeItem(ACCESS_STORAGE_KEY);
@@ -427,6 +801,7 @@ export default function AppHomePageImplGray() {
     if (!refreshRes.ok || !refreshData?.access) {
       setToken(null);
       setActiveSpaceId(null);
+      setActiveOrganizationId(null);
       setActiveProjectId(null);
       setActiveBoardId(null);
       localStorage.removeItem(ACCESS_STORAGE_KEY);
@@ -440,7 +815,7 @@ export default function AppHomePageImplGray() {
     return nextTokens.access;
   }
 
-  async function fetchSpaces(nextAccess: string, options?: { keepActiveIfPossible?: boolean }): Promise<Space[]> {
+  async function fetchSpaces(nextAccess: string): Promise<Space[]> {
     let accessToken = nextAccess;
     let res = await fetch(getApiUrl("/api/auth/spaces"), { headers: { Authorization: `Bearer ${accessToken}` } });
     let data: any = await res.json().catch(() => ({}));
@@ -462,18 +837,6 @@ export default function AppHomePageImplGray() {
         // ignore
       }
       return [];
-    }
-    let preferred = list[0].id;
-    try {
-      const saved = localStorage.getItem(LAST_ACTIVE_SPACE_STORAGE_KEY);
-      if (saved && list.some((s: Space) => s.id === saved)) preferred = saved;
-    } catch {
-      // ignore
-    }
-    if (options?.keepActiveIfPossible) {
-      setActiveSpaceId((prev) => (prev && list.some((s: Space) => s.id === prev) ? prev : preferred));
-    } else {
-      setActiveSpaceId(preferred);
     }
     return list;
   }
@@ -542,9 +905,103 @@ export default function AppHomePageImplGray() {
 
   useEffect(() => {
     if (!token) return;
-    if (activeSpaceId) return;
     fetchSpaces(token.access).catch((e: any) => setAuthError(e?.message ?? "Ошибка загрузки"));
   }, [token]);
+
+  useEffect(() => {
+    if (!token || !spaces.length) return;
+    const membershipIds = new Set(orgMemberships.map((m) => normalizeOrgIdKey(m.organization_id)));
+    if (orgMemberships.length > 0 && activeOrganizationId) {
+      const match = orgMemberships.find((m) => normalizeOrgIdKey(m.organization_id) === normalizeOrgIdKey(activeOrganizationId));
+      if (!match) {
+        setActiveOrganizationId(null);
+        return;
+      }
+      if (normalizeOrgIdKey(match.organization_id) !== normalizeOrgIdKey(activeOrganizationId)) {
+        setActiveOrganizationId(match.organization_id);
+        return;
+      }
+    }
+
+    let orgId = activeOrganizationId;
+    if (!orgId || (membershipIds.size > 0 && !membershipIds.has(normalizeOrgIdKey(orgId)))) {
+      try {
+        const saved = localStorage.getItem(LAST_ACTIVE_ORG_STORAGE_KEY);
+        if (saved && (membershipIds.size === 0 || membershipIds.has(normalizeOrgIdKey(saved)))) orgId = saved;
+        else orgId = null;
+      } catch {
+        orgId = null;
+      }
+    }
+    if (!orgId && activeSpaceId) {
+      const sid = spaces.find((s) => s.id === activeSpaceId)?.organization_id;
+      if (sid && (membershipIds.size === 0 || membershipIds.has(normalizeOrgIdKey(sid)))) orgId = sid;
+    }
+    if (!orgId && membershipIds.size > 0) {
+      const almaz = orgMemberships.find((m) => isAlmazgeoburOrganizationName(m.organization_name));
+      if (almaz) orgId = almaz.organization_id;
+    }
+    if (!orgId && membershipIds.size > 0) {
+      const keys = [...membershipIds];
+      const adminKeys = keys.filter((k) => {
+        const m = orgMemberships.find((om) => normalizeOrgIdKey(om.organization_id) === k);
+        return m?.role === "admin";
+      });
+      const findOrgIdForKey = (k: string) =>
+        orgMemberships.find((om) => normalizeOrgIdKey(om.organization_id) === k)?.organization_id ?? null;
+      const pickKeyWithSpace = (candidates: string[]) =>
+        candidates.find((k) => spaces.some((s) => normalizeOrgIdKey(s.organization_id) === k));
+      if (adminKeys.length) {
+        const preferred = pickKeyWithSpace(adminKeys);
+        if (preferred) orgId = findOrgIdForKey(preferred);
+      }
+      if (!orgId) {
+        const firstWithSpace = pickKeyWithSpace(keys);
+        if (firstWithSpace) orgId = findOrgIdForKey(firstWithSpace);
+      }
+      if (!orgId) {
+        orgId = orgMemberships.find((m) => m.role === "admin")?.organization_id ?? orgMemberships[0]?.organization_id ?? null;
+      }
+    }
+    if (!orgId && membershipIds.size === 0 && spaces.length) {
+      if (!profileMeLoadedRef.current) {
+        return;
+      }
+      orgId = spaces[0].organization_id;
+    }
+
+    if (orgId !== activeOrganizationId) {
+      setActiveOrganizationId(orgId);
+      return;
+    }
+
+    const inOrg = spaces.filter((s) => normalizeOrgIdKey(s.organization_id) === normalizeOrgIdKey(orgId));
+    if (!inOrg.length) {
+      setActiveSpaceId(null);
+      setActiveBoardId(null);
+      setActiveProjectId(null);
+      return;
+    }
+    if (activeSpaceId && inOrg.some((s) => s.id === activeSpaceId)) return;
+
+    let preferred = inOrg[0].id;
+    try {
+      const saved = localStorage.getItem(LAST_ACTIVE_SPACE_STORAGE_KEY);
+      if (saved && inOrg.some((s) => s.id === saved)) preferred = saved;
+    } catch {
+      // ignore
+    }
+    setActiveSpaceId(preferred);
+  }, [token, spaces, orgMemberships, activeOrganizationId, activeSpaceId]);
+
+  useEffect(() => {
+    if (!activeOrganizationId) return;
+    try {
+      localStorage.setItem(LAST_ACTIVE_ORG_STORAGE_KEY, activeOrganizationId);
+    } catch {
+      // ignore
+    }
+  }, [activeOrganizationId]);
 
   useEffect(() => {
     if (!token || !activeSpaceId) return;
@@ -562,7 +1019,11 @@ export default function AppHomePageImplGray() {
   }, [activeSpaceId]);
 
   useEffect(() => {
-    if (!token) return;
+    if (!token) {
+      profileMeLoadedRef.current = false;
+      return;
+    }
+    profileMeLoadedRef.current = false;
     fetchCurrentUser(token.access).catch(() => {});
   }, [token]);
 
@@ -572,9 +1033,73 @@ export default function AppHomePageImplGray() {
   }, [token, activeSpaceId]);
 
   useEffect(() => {
+    if (!token?.access || !activeOrganizationId) {
+      setDmUnreadCount(0);
+      return;
+    }
+    fetchDmUnread(token.access, activeOrganizationId).catch(() => {});
+  }, [token?.access, activeOrganizationId]);
+
+  useEffect(() => {
+    if (!token?.access || !currentUserId) return;
+    const ws = new WebSocket(getWsUrl(`/ws/messages/?token=${encodeURIComponent(token.access)}`));
+    ws.onmessage = (ev) => {
+      try {
+        const parsed = JSON.parse(ev.data) as {
+          type?: string;
+          payload?: { recipient_id?: string; organization_id?: string };
+        };
+        if (parsed.type !== "direct_message" || !parsed.payload) return;
+        const p = parsed.payload;
+        if (p.recipient_id !== currentUserId) return;
+        if (activeOrganizationId && p.organization_id && p.organization_id !== activeOrganizationId) return;
+        void fetchDmUnread(token.access, activeOrganizationId);
+      } catch {
+        // ignore
+      }
+    };
+    return () => {
+      ws.close();
+    };
+  }, [token?.access, currentUserId, activeOrganizationId]);
+
+  useEffect(() => {
     if (!token || !activeBoardId) return;
     fetchBoardGrid(activeBoardId, token.access);
   }, [token, activeBoardId, fetchBoardGrid]);
+
+  useEffect(() => {
+    if (!token?.access || !activeSpaceId) {
+      setFilterAssigneeOptions([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(getApiUrl("/api/auth/users"), {
+          headers: {
+            Authorization: `Bearer ${token.access}`,
+            "X-Space-Id": activeSpaceId,
+            ...(activeOrganizationId ? { "X-Organization-Id": activeOrganizationId } : {}),
+          },
+        });
+        const data = (await res.json().catch(() => [])) as unknown;
+        if (cancelled || !res.ok) return;
+        const arr = Array.isArray(data) ? data : [];
+        setFilterAssigneeOptions(
+          arr.map((u: { id: string; email: string; full_name: string }) => ({
+            id: u.id,
+            label: (u.full_name || "").trim() || u.email,
+          })),
+        );
+      } catch {
+        if (!cancelled) setFilterAssigneeOptions([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [token?.access, activeSpaceId, activeOrganizationId]);
 
   async function fetchDocs(nextAccess: string, spaceId: string) {
     setDocsLoading(true);
@@ -594,17 +1119,34 @@ export default function AppHomePageImplGray() {
     }
   }
 
-  async function fetchOrganizationUsers(nextAccess: string, spaceId: string) {
+  async function fetchOrganizationUsers(
+    nextAccess: string,
+    opts: { spaceId?: string | null; organizationId?: string | null },
+  ) {
     setOrgUsersLoading(true);
     setOrgUsersError(null);
     setOrgUsersSuccess(null);
     try {
-      const res = await fetch(getApiUrl("/api/auth/users"), {
-        headers: { Authorization: `Bearer ${nextAccess}`, "X-Space-Id": spaceId },
-      });
+      const headers: Record<string, string> = { Authorization: `Bearer ${nextAccess}` };
+      if (opts.organizationId) headers["X-Organization-Id"] = opts.organizationId;
+      else if (opts.spaceId) headers["X-Space-Id"] = opts.spaceId;
+      else throw new Error("Нет контекста организации");
+      const res = await fetch(getApiUrl("/api/auth/users"), { headers });
       const data = (await res.json().catch(() => [])) as any;
       if (!res.ok) throw new Error(data?.detail ?? "Не удалось загрузить пользователей");
-      setOrgUsers(Array.isArray(data) ? (data as OrgUser[]) : []);
+      const list = Array.isArray(data) ? data.map((u: any) => normalizeOrgUserFromApi(u)) : [];
+      setOrgUsers(list);
+      if (opts.organizationId) {
+        setSidebarOrgMembers(
+          list.map((u) => ({
+            id: String(u.id),
+            full_name: String(u.full_name ?? ""),
+            email: String(u.email ?? ""),
+            avatar_url: (u.avatar_url && String(u.avatar_url).trim()) || undefined,
+            role: String(u.role ?? "executor"),
+          })),
+        );
+      }
     } catch (e: any) {
       setOrgUsersError(e?.message ?? "Ошибка загрузки пользователей");
     } finally {
@@ -620,17 +1162,20 @@ export default function AppHomePageImplGray() {
       const data = (await res.json().catch(() => ({}))) as CurrentUserMe | { detail?: string };
       if (!res.ok) throw new Error((data as { detail?: string }).detail ?? "Не удалось загрузить профиль");
       const me = data as CurrentUserMe;
-      const role = me.effective_role || "user";
-      setEffectiveRole(role);
       setOrgMemberships(Array.isArray(me.memberships) ? me.memberships : []);
       const u = me.user;
       if (u) {
+        setCurrentUserId(u.id);
         setProfileFullName(u.full_name || "");
         setProfileAvatarUrl(u.avatar_url || "");
+      } else {
+        setCurrentUserId(null);
       }
     } catch {
-      setEffectiveRole("user");
       setOrgMemberships([]);
+      setCurrentUserId(null);
+    } finally {
+      profileMeLoadedRef.current = true;
     }
   }
 
@@ -655,6 +1200,19 @@ export default function AppHomePageImplGray() {
     }
   }
 
+  async function fetchDmUnread(nextAccess: string, organizationId: string | null) {
+    if (!organizationId) return;
+    try {
+      const res = await fetch(getApiUrl("/api/messages/unread-count"), {
+        headers: { Authorization: `Bearer ${nextAccess}`, "X-Organization-Id": organizationId },
+      });
+      const data = (await res.json().catch(() => ({}))) as { unread_count?: number };
+      if (res.ok) setDmUnreadCount(Math.max(0, Number(data.unread_count ?? 0)));
+    } catch {
+      // ignore
+    }
+  }
+
   useEffect(() => {
     if (!token || !activeSpaceId) return;
     if (kaitenTab !== "settings") return;
@@ -670,15 +1228,112 @@ export default function AppHomePageImplGray() {
   }, [selectedDoc?.id]);
 
   useEffect(() => {
-    if (!token || !activeSpaceId) return;
+    if (!token || !activeOrganizationId) return;
     if (kaitenTab !== "administration") return;
     if (!isAdmin) {
       setKaitenTab("lists");
       setOrgUsersError(uiLanguage === "en" ? "Administration is available for admins only" : "Администрирование доступно только администратору");
       return;
     }
-    fetchOrganizationUsers(token.access, activeSpaceId).catch(() => {});
-  }, [token, activeSpaceId, kaitenTab, isAdmin, uiLanguage]);
+    fetchOrganizationUsers(token.access, { organizationId: activeOrganizationId, spaceId: activeSpaceId }).catch(() => {});
+  }, [token, activeOrganizationId, activeSpaceId, kaitenTab, isAdmin, uiLanguage]);
+
+  useEffect(() => {
+    if (!token?.access || !activeOrganizationId) {
+      setSidebarOrgMembers([]);
+      setSidebarOrgMembersLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setSidebarOrgMembersLoading(true);
+    (async () => {
+      try {
+        const res = await fetch(getApiUrl("/api/auth/users"), {
+          headers: {
+            Authorization: `Bearer ${token.access}`,
+            "X-Organization-Id": activeOrganizationId,
+          },
+        });
+        const data = (await res.json().catch(() => [])) as unknown;
+        if (cancelled) return;
+        if (!res.ok || !Array.isArray(data)) {
+          setSidebarOrgMembers([]);
+          return;
+        }
+        setSidebarOrgMembers(
+          data.map((u: { id: string; full_name?: string; email?: string; avatar_url?: string; role?: string }) => ({
+            id: String(u.id),
+            full_name: String(u.full_name ?? ""),
+            email: String(u.email ?? ""),
+            avatar_url: (u.avatar_url && String(u.avatar_url).trim()) || undefined,
+            role: String(u.role ?? "executor"),
+          })),
+        );
+      } catch {
+        if (!cancelled) setSidebarOrgMembers([]);
+      } finally {
+        if (!cancelled) setSidebarOrgMembersLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [token?.access, activeOrganizationId]);
+
+  useEffect(() => {
+    if (kaitenTab !== "archive" || !token?.access || !activeSpaceId) {
+      if (kaitenTab !== "archive") setArchiveCards([]);
+      return;
+    }
+    const boardsInSpace = boards.filter((b) => b.space_id === activeSpaceId);
+    if (!boardsInSpace.length) {
+      setArchiveCards([]);
+      setArchiveLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setArchiveLoading(true);
+    (async () => {
+      try {
+        const results = await Promise.all(
+          boardsInSpace.map((b) =>
+            fetch(getApiUrl(`/api/kanban/boards/${b.id}/archive`), {
+              headers: { Authorization: `Bearer ${token.access}`, "X-Space-Id": activeSpaceId },
+            }).then((r) => (r.ok ? r.json() : [])),
+          ),
+        );
+        const items: ArchivedCardItem[] = [];
+        for (const data of results) {
+          if (!Array.isArray(data)) continue;
+          for (const raw of data) {
+            items.push({
+              id: String(raw?.id ?? ""),
+              title: String(raw?.title ?? "—"),
+              board_name: String(raw?.board_name ?? ""),
+              column_name: String(raw?.column_name ?? ""),
+              archived_at: raw?.archived_at ? String(raw.archived_at) : null,
+              total_effort_seconds:
+                typeof raw?.total_effort_seconds === "number"
+                  ? raw.total_effort_seconds
+                  : Number(raw?.total_effort_seconds || 0),
+            });
+          }
+        }
+        if (!cancelled) setArchiveCards(items);
+      } catch {
+        if (!cancelled) setArchiveCards([]);
+      } finally {
+        if (!cancelled) setArchiveLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [kaitenTab, token?.access, activeSpaceId, boards]);
+
+  useEffect(() => {
+    setDmPeer(null);
+  }, [activeOrganizationId]);
 
   async function fetchDocDetail(nextAccess: string, docId: string) {
     const res = await fetch(getApiUrl(`/api/docs/${docId}`), {
@@ -700,7 +1355,7 @@ export default function AppHomePageImplGray() {
         headers: { Authorization: `Bearer ${token.access}`, "X-Space-Id": activeSpaceId, "Content-Type": "application/json" },
         body: JSON.stringify({
           title: untitledTitle,
-          content: serializeDocumentContent("", [{ id: crypto.randomUUID(), type: "text", content: "" }]),
+          content: serializeDocumentContent("", [{ id: randomId(), type: "text", content: "" }]),
           doc_type: "document",
         }),
       });
@@ -723,7 +1378,7 @@ export default function AppHomePageImplGray() {
   }
 
   const addDocBlock = (type: DocBlock["type"] = "text", afterId?: string) => {
-    const nextId = crypto.randomUUID();
+    const nextId = randomId();
     const newBlock: DocBlock = { id: nextId, type, content: "", checked: false };
     setDocBlocks((prev) => {
       if (!afterId) return [...prev, newBlock];
@@ -759,7 +1414,7 @@ export default function AppHomePageImplGray() {
       if (idx > 0 && prev.length > 1) {
         setPendingFocusBlockId(prev[idx - 1].id);
       }
-      return next.length ? next : [{ id: crypto.randomUUID(), type: "text", content: "" }];
+      return next.length ? next : [{ id: randomId(), type: "text", content: "" }];
     });
     if (slashMenu?.blockId === id) setSlashMenu(null);
     setSlashMenuIndex(0);
@@ -798,7 +1453,7 @@ export default function AppHomePageImplGray() {
   };
 
   const duplicateDocBlock = (id: string) => {
-    const nextId = crypto.randomUUID();
+    const nextId = randomId();
     setDocBlocks((prev) => {
       const idx = prev.findIndex((b) => b.id === id);
       if (idx < 0) return prev;
@@ -1000,25 +1655,17 @@ export default function AppHomePageImplGray() {
     }
   }
 
-  const authTitle = useMemo(() => (mode === "register" ? "Создать аккаунт" : "Вход"), [mode]);
+  const authTitle = useMemo(() => (uiLanguage === "en" ? "Sign in" : "Вход"), [uiLanguage]);
 
   async function submitAuth() {
     setAuthLoading(true);
     setAuthError(null);
+    setAuthNotice(null);
     try {
-      const isOtpLogin = mode === "login" && loginMethod === "code";
-      const url = getApiUrl(
-        mode === "register" ? "/api/auth/register" : isOtpLogin ? "/api/auth/login-otp" : "/api/auth/login",
-      );
-      const res = await fetch(url, {
+      const res = await fetch(getApiUrl("/api/auth/login-otp"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body:
-          mode === "register"
-            ? JSON.stringify({ email, password, organization_name: orgName, full_name: "" })
-            : isOtpLogin
-              ? JSON.stringify({ email, code: otpCode.replace(/\s/g, "") })
-              : JSON.stringify({ email, password }),
+        body: JSON.stringify({ email, code: otpCode.replace(/\s/g, "") }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.detail ?? "Ошибка авторизации");
@@ -1035,6 +1682,76 @@ export default function AppHomePageImplGray() {
     }
   }
 
+  async function submitRecoverPassword(token: string) {
+    if (recoverNewPassword.length < 8) {
+      setAuthError(uiLanguage === "en" ? "Password must be at least 8 characters" : "Пароль — не менее 8 символов");
+      return;
+    }
+    if (recoverNewPassword !== recoverConfirmPassword) {
+      setAuthError(uiLanguage === "en" ? "Passwords do not match" : "Пароли не совпадают");
+      return;
+    }
+    setRecoverBusy(true);
+    setAuthError(null);
+    try {
+      const res = await fetch(getApiUrl("/api/auth/reset-password"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token, new_password: recoverNewPassword }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const d = data?.detail;
+        throw new Error(
+          typeof d === "string"
+            ? d
+            : uiLanguage === "en"
+              ? "Invalid or expired link"
+              : "Ссылка недействительна или истекла",
+        );
+      }
+      setRecoverNewPassword("");
+      setRecoverConfirmPassword("");
+      router.replace("/app", { scroll: false });
+      setAuthError(null);
+      setAuthNotice(
+        uiLanguage === "en"
+          ? "Password updated. Sign in with the code from your email."
+          : "Пароль обновлён. Войдите по коду из письма.",
+      );
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : uiLanguage === "en" ? "Error" : "Ошибка";
+      setAuthError(msg);
+    } finally {
+      setRecoverBusy(false);
+    }
+  }
+
+  async function submitRequestLoginCode() {
+    setRequestLoginCodeBusy(true);
+    setRequestLoginCodeMsg(null);
+    setAuthError(null);
+    try {
+      const res = await fetch(getApiUrl("/api/auth/request-login-code"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: email.trim().toLowerCase() }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.detail ?? (uiLanguage === "en" ? "Request failed" : "Не удалось отправить"));
+      setRequestLoginCodeMsg(
+        uiLanguage === "en"
+          ? "If this email is registered, we sent a 6-digit code. Check your inbox."
+          : "Если аккаунт с таким email есть, мы отправили 6-значный код на почту.",
+      );
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : uiLanguage === "en" ? "Error" : "Ошибка";
+      setAuthError(msg);
+    } finally {
+      setRequestLoginCodeBusy(false);
+    }
+  }
+
   const handleSpaceCreated = async (space: { id: string; name: string }) => {
     if (!token) {
       setSpaces((prev) => [...prev, { ...space, organization_id: "" }]);
@@ -1042,7 +1759,7 @@ export default function AppHomePageImplGray() {
       return;
     }
     try {
-      const refreshed = await fetchSpaces(token.access, { keepActiveIfPossible: true });
+      const refreshed = await fetchSpaces(token.access);
       const createdExists = refreshed.some((s) => s.id === space.id);
       setActiveSpaceId(createdExists ? space.id : refreshed[0]?.id ?? null);
     } catch {
@@ -1066,7 +1783,7 @@ export default function AppHomePageImplGray() {
       if (!res.ok) {
         if (res.status === 404) {
           try {
-            const refreshed = await fetchSpaces(token.access, { keepActiveIfPossible: true });
+            const refreshed = await fetchSpaces(token.access);
             if (!refreshed.some((s) => s.id === spaceId)) {
               // Пространство уже удалено (или недоступно) — синхронизируем UI и считаем операцию завершённой.
               return true;
@@ -1111,7 +1828,7 @@ export default function AppHomePageImplGray() {
         return false;
       }
       try {
-        await fetchSpaces(token.access, { keepActiveIfPossible: true });
+        await fetchSpaces(token.access);
       } catch (e: any) {
         const nextSpaces = spaces.filter((s) => s.id !== spaceId);
         setSpaces(nextSpaces);
@@ -1234,6 +1951,8 @@ export default function AppHomePageImplGray() {
         });
         const data = (await res.json()) as CardDetail;
         if (!res.ok) throw new Error((data as any)?.detail ?? "Не удалось загрузить карточку");
+        if (data.space_id) setActiveSpaceId(data.space_id);
+        if (data.board_id) setActiveBoardId(data.board_id);
         setSelectedCard(data);
       } catch (e: any) {
         setSelectedCardError(e?.message ?? "Не удалось загрузить карточку");
@@ -1241,6 +1960,44 @@ export default function AppHomePageImplGray() {
     },
     [token]
   );
+
+  const cardIdFromUrl = searchParams.get("card");
+  useEffect(() => {
+    if (!token?.access || !cardIdFromUrl) {
+      if (!cardIdFromUrl) deepLinkCardHandledRef.current = null;
+      return;
+    }
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    if (!uuidRe.test(cardIdFromUrl)) return;
+    if (deepLinkCardHandledRef.current === cardIdFromUrl) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(getApiUrl(`/api/kanban/cards/${cardIdFromUrl}`), {
+          headers: { Authorization: `Bearer ${token.access}` },
+        });
+        const data = (await res.json()) as CardDetail & { detail?: string };
+        if (cancelled) return;
+        if (!res.ok) {
+          setSelectedCardError(
+            data.detail ?? (uiLanguage === "en" ? "Could not open shared card" : "Не удалось открыть карточку по ссылке"),
+          );
+          return;
+        }
+        deepLinkCardHandledRef.current = cardIdFromUrl;
+        if (data.space_id) setActiveSpaceId(data.space_id);
+        if (data.board_id) setActiveBoardId(data.board_id);
+        setKaitenTab("lists");
+        setSelectedCard(data);
+        setSelectedCardError(null);
+      } catch (e: any) {
+        if (!cancelled) setSelectedCardError(e?.message ?? "Ошибка ссылки на карточку");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [token?.access, cardIdFromUrl, uiLanguage]);
 
   const refreshSelectedCard = useCallback(async () => {
     if (!token || !selectedCard?.id) return;
@@ -1259,60 +2016,41 @@ export default function AppHomePageImplGray() {
     }
   };
 
-  const handleCreateBoard = async () => {
+  const newBoardDefaultName = useMemo(
+    () => (uiLanguage === "en" ? `Board ${visibleBoards.length + 1}` : `Доска ${visibleBoards.length + 1}`),
+    [visibleBoards.length, uiLanguage],
+  );
+
+  const newBoardProjectId = useMemo(() => {
+    if (!activeSpaceId) return null;
+    const activeProjects = projects.filter((project) => project.space_id === activeSpaceId);
+    return activeProjectId && activeProjects.some((project) => project.id === activeProjectId)
+      ? activeProjectId
+      : activeProjects[0]?.id ?? null;
+  }, [activeSpaceId, activeProjectId, projects]);
+
+  const openCreateBoardDialog = useCallback(() => {
     if (!canManageBoard) {
       setAuthError(uiLanguage === "en" ? "Only manager and above can create boards" : "Создавать доски могут только менеджер и выше");
       return;
     }
     if (!token || !activeSpaceId) return;
+    setCreateBoardOpen(true);
+  }, [canManageBoard, token, activeSpaceId, uiLanguage]);
+
+  const handleBoardCreated = async (board: { id: string; name: string }, accessToken: string) => {
+    if (!activeSpaceId) return;
     try {
-      let accessToken = token.access;
-      const activeProjects = projects.filter((project) => project.space_id === activeSpaceId);
-      const projectIdForBoard =
-        activeProjectId && activeProjects.some((project) => project.id === activeProjectId)
-          ? activeProjectId
-          : activeProjects[0]?.id || null;
-      const name =
-        uiLanguage === "en"
-          ? `Board ${boards.length + 1}`
-          : `Доска ${boards.length + 1}`;
-      const createBoardRequest = async (accessToken: string) =>
-        fetch(getApiUrl("/api/kanban/boards"), {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            "Content-Type": "application/json",
-            "X-Space-Id": activeSpaceId,
-          },
-          body: JSON.stringify({ name, space_id: activeSpaceId, project_id: projectIdForBoard }),
-        });
-      let res = await createBoardRequest(accessToken);
-      let data: any = await res.json().catch(() => ({}));
-      if (!res.ok && res.status === 401 && data?.detail === "invalid_token") {
-        if (!token.refresh) {
-          throw new Error("Сессия истекла. Войдите заново.");
-        }
-        const refreshRes = await fetch(getApiUrl("/api/auth/refresh"), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ refresh: token.refresh }),
-        });
-        const refreshData: any = await refreshRes.json().catch(() => ({}));
-        if (!refreshRes.ok || !refreshData?.access) {
-          throw new Error("Сессия истекла. Войдите заново.");
-        }
-        const nextTokens = { access: refreshData.access as string, refresh: refreshData.refresh as string | undefined };
-        setToken(nextTokens);
-        localStorage.setItem(ACCESS_STORAGE_KEY, nextTokens.access);
-        if (nextTokens.refresh) localStorage.setItem(REFRESH_STORAGE_KEY, nextTokens.refresh);
-        accessToken = nextTokens.access;
-        res = await createBoardRequest(accessToken);
-        data = await res.json().catch(() => ({}));
-      }
-      if (!res.ok) throw new Error(data?.detail ?? "Не удалось создать доску");
       await fetchBoardsForSpace(accessToken, activeSpaceId);
-    } catch (e: any) {
-      setAuthError(e?.message ?? "Ошибка создания доски");
+      setActiveBoardId(board.id);
+    } catch (e: unknown) {
+      const msg =
+        e instanceof Error
+          ? e.message
+          : uiLanguage === "en"
+            ? "Could not refresh boards"
+            : "Не удалось обновить список досок";
+      setAuthError(msg);
     }
   };
 
@@ -1345,124 +2083,248 @@ export default function AppHomePageImplGray() {
     ];
   }, [boardGrid]);
 
+  const reportStats = useMemo(() => {
+    if (!boardGrid) return null;
+    let total = 0;
+    let estimateSum = 0;
+    const byColumn: Array<{ name: string; count: number; is_done: boolean }> = [];
+    for (const col of boardGrid.columns) {
+      const n = col.cards.length;
+      total += n;
+      for (const c of col.cards) {
+        const p = c.estimate_points;
+        if (typeof p === "number" && !Number.isNaN(p)) estimateSum += p;
+      }
+      byColumn.push({ name: col.name, count: n, is_done: col.is_done });
+    }
+    return { boardName: boardGrid.board.name, total, estimateSum, byColumn };
+  }, [boardGrid]);
+
+  const commitAuthLanguage = useCallback((l: AppLanguage) => {
+    setUiLanguage(l);
+    setStoredLanguage(l);
+  }, []);
+  const commitAuthTheme = useCallback((t: ColorTheme) => {
+    setUiTheme(t);
+    setStoredTheme(t);
+  }, []);
+
   if (!token || !access) {
-    return (
-      <div className="min-h-screen flex items-center justify-center p-6" style={{ background: uiColors.pageBg }}>
-        <div
-          className="w-full max-w-md rounded-3xl shadow-sm p-6"
-          style={{ border: `1px solid ${uiColors.border}`, background: uiColors.cardBg }}
-        >
-          <div className="flex items-center justify-between gap-4 mb-4">
-            <div className="font-extrabold text-lg" style={{ color: uiColors.text }}>AGB Tasks</div>
-            <div className="text-sm" style={{ color: uiColors.textMuted }}>Вход</div>
-          </div>
+    const recoverLabels =
+      uiLanguage === "en"
+        ? {
+            header: "Sign in",
+            title: "New password",
+            hint: "Enter a new password for your account (at least 8 characters).",
+            newPass: "New password",
+            confirm: "Confirm password",
+            submit: "Set password",
+            back: "Back to sign in",
+            wait: "Please wait…",
+          }
+        : {
+            header: "Вход",
+            title: "Новый пароль",
+            hint: "Придумайте новый пароль для аккаунта (не менее 8 символов).",
+            newPass: "Новый пароль",
+            confirm: "Повторите пароль",
+            submit: "Установить пароль",
+            back: "Назад ко входу",
+            wait: "Подождите…",
+          };
 
-          <div className="font-bold text-2xl tracking-tight" style={{ color: uiColors.text }}>{authTitle}</div>
-          <div className="mt-2 text-sm" style={{ color: uiColors.textMuted }}>Простая регистрация и авторизация</div>
-
-          <div className="mt-5 flex gap-2">
-            <GreyButton
-              variant={mode === "register" ? "primary" : "soft"}
-              onClick={() => {
-                setMode("register");
-                setLoginMethod("password");
-              }}
-            >
-              Регистрация
-            </GreyButton>
-            <GreyButton
-              variant={mode === "login" ? "primary" : "soft"}
-              onClick={() => {
-                setMode("login");
-                setLoginMethod("password");
-              }}
-            >
-              Вход
-            </GreyButton>
-          </div>
-
-          {mode === "login" ? (
-            <div className="mt-4 flex flex-wrap gap-2">
-              <GreyButton variant={loginMethod === "password" ? "primary" : "soft"} onClick={() => setLoginMethod("password")}>
-                Пароль
-              </GreyButton>
-              <GreyButton variant={loginMethod === "code" ? "primary" : "soft"} onClick={() => setLoginMethod("code")}>
-                Вход по коду
-              </GreyButton>
+    if (recoverTokenParam && recoverTokenParam.length >= 20) {
+      return (
+        <>
+          <AuthScreenControls language={uiLanguage} onLanguage={commitAuthLanguage} onTheme={commitAuthTheme} />
+          <div className="min-h-screen flex items-center justify-center p-6" style={{ background: uiColors.pageBg }}>
+            <div className="w-full max-w-md px-4 py-8 flex flex-col items-center">
+            <div className="mb-6 flex justify-center">
+              <Image src="/almazgeobur-logo.svg" alt="Almazgeobur" width={72} height={72} priority />
             </div>
-          ) : null}
+            <div className="font-bold text-2xl tracking-tight text-center w-full" style={{ color: uiColors.text }}>
+              {recoverLabels.title}
+            </div>
+            <p className="mt-2 text-sm leading-relaxed" style={{ color: uiColors.textMuted }}>
+              {recoverLabels.hint}
+            </p>
+            <div className="mt-5 space-y-4">
+              <label className="block">
+                <div className="text-[var(--k-text-muted)] text-sm mb-2">{recoverLabels.newPass}</div>
+                <input
+                  value={recoverNewPassword}
+                  onChange={(e) => setRecoverNewPassword(e.target.value)}
+                  type="password"
+                  autoComplete="new-password"
+                  className="w-full text-center rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] text-[var(--k-text)] px-3 py-2 outline-none focus:border-[#8A2BE2]"
+                />
+              </label>
+              <label className="block">
+                <div className="text-[var(--k-text-muted)] text-sm mb-2">{recoverLabels.confirm}</div>
+                <input
+                  value={recoverConfirmPassword}
+                  onChange={(e) => setRecoverConfirmPassword(e.target.value)}
+                  type="password"
+                  autoComplete="new-password"
+                  className="w-full text-center rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] text-[var(--k-text)] px-3 py-2 outline-none focus:border-[#8A2BE2]"
+                />
+              </label>
+              {authError ? <div className="text-red-500 text-sm">{authError}</div> : null}
+              <GreyButton
+                onClick={() => submitRecoverPassword(recoverTokenParam)}
+                disabled={recoverBusy}
+                variant="primary"
+              >
+                {recoverBusy ? recoverLabels.wait : recoverLabels.submit}
+              </GreyButton>
+              <button
+                type="button"
+                className="w-full text-center text-sm font-medium py-2 rounded-xl transition-colors hover:opacity-90"
+                style={{ color: uiColors.textMuted }}
+                onClick={() => {
+                  setAuthError(null);
+                  router.replace("/app", { scroll: false });
+                }}
+              >
+                {recoverLabels.back}
+              </button>
+            </div>
+          </div>
+        </div>
+        </>
+      );
+    }
 
-          <div className="mt-5 space-y-4">
+    return (
+      <>
+        <AuthScreenControls language={uiLanguage} onLanguage={commitAuthLanguage} onTheme={commitAuthTheme} />
+        <div className="min-h-screen flex items-center justify-center p-6" style={{ background: uiColors.pageBg }}>
+        <div className="w-full max-w-md px-4 py-8 flex flex-col items-center">
+          <div className="mb-6 flex justify-center">
+            <Image src="/almazgeobur-logo.svg" alt="Almazgeobur" width={72} height={72} priority />
+          </div>
+
+          <div className="font-bold text-2xl tracking-tight text-center w-full" style={{ color: uiColors.text }}>
+            {authTitle}
+          </div>
+          <div className="mt-2 text-sm text-center w-full" style={{ color: uiColors.textMuted }}>
+            {uiLanguage === "en" ? "Sign in with the code from your email" : "Вход по коду из письма"}
+          </div>
+
+          <div className="mt-6 w-full space-y-4">
             <label className="block">
-              <div className="text-[var(--k-text-muted)] text-sm mb-2">Эл. почта</div>
+              <div className="text-[var(--k-text-muted)] text-sm mb-2 text-center">
+                {uiLanguage === "en" ? "Email" : "Эл. почта"}
+              </div>
               <input
                 value={email}
-                onChange={(e) => setEmail(e.target.value)}
+                onChange={(e) => {
+                  setEmail(e.target.value);
+                  setRequestLoginCodeMsg(null);
+                }}
                 type="email"
-                className="w-full rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] text-[var(--k-text)] px-3 py-2 outline-none focus:border-[#8A2BE2]"
+                className="w-full text-center rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] text-[var(--k-text)] px-3 py-2 outline-none focus:border-[#8A2BE2]"
               />
             </label>
-            {mode === "login" && loginMethod === "code" ? (
-              <label className="block">
-                <div className="text-[var(--k-text-muted)] text-sm mb-2">Код из письма (6 цифр)</div>
+            <label className="block">
+              <div className="text-[var(--k-text-muted)] text-sm mb-2 text-center">
+                {uiLanguage === "en" ? "Code from email (6 digits)" : "Код из письма (6 цифр)"}
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
                 <input
                   value={otpCode}
                   onChange={(e) => setOtpCode(e.target.value)}
                   inputMode="numeric"
                   autoComplete="one-time-code"
                   placeholder="000000"
-                  className="w-full rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] text-[var(--k-text)] px-3 py-2 outline-none focus:border-[#8A2BE2] tracking-widest text-lg"
+                  className="min-w-[7rem] flex-1 text-center rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] text-[var(--k-text)] px-3 py-2 outline-none focus:border-[#8A2BE2] tracking-widest text-lg"
                 />
-                <div className="text-[var(--k-text-muted)] text-xs mt-1.5">
-                  Запросите код в настройках профиля или попросите администратора.
-                </div>
-              </label>
-            ) : (
-              <label className="block">
-                <div className="text-[var(--k-text-muted)] text-sm mb-2">Пароль</div>
-                <input
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  type="password"
-                  className="w-full rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] text-[var(--k-text)] px-3 py-2 outline-none focus:border-[#8A2BE2]"
-                />
-              </label>
-            )}
-            {mode === "register" ? (
-              <label className="block">
-                <div className="text-[var(--k-text-muted)] text-sm mb-2">Организация</div>
-                <input
-                  value={orgName}
-                  onChange={(e) => setOrgName(e.target.value)}
-                  type="text"
-                  className="w-full rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] text-[var(--k-text)] px-3 py-2 outline-none focus:border-[#8A2BE2]"
-                />
-              </label>
-            ) : null}
+                <GreyButton
+                  variant="soft"
+                  disabled={requestLoginCodeBusy || !email.trim()}
+                  onClick={() => submitRequestLoginCode()}
+                >
+                  {requestLoginCodeBusy
+                    ? uiLanguage === "en"
+                      ? "Sending…"
+                      : "Отправляем…"
+                    : uiLanguage === "en"
+                      ? "Get code"
+                      : "Запросить код"}
+                </GreyButton>
+              </div>
+              {requestLoginCodeMsg ? (
+                <div className="text-emerald-600 text-sm mt-2 text-center">{requestLoginCodeMsg}</div>
+              ) : null}
+            </label>
 
-            {authError ? <div className="text-red-500 text-sm">{authError}</div> : null}
+            {authNotice ? <div className="text-emerald-600 text-sm text-center">{authNotice}</div> : null}
+            {authError ? <div className="text-red-500 text-sm text-center">{authError}</div> : null}
 
-            <GreyButton
-              onClick={() => submitAuth()}
-              disabled={
-                authLoading ||
-                (mode === "login" && loginMethod === "code" && (otpCode.replace(/\s/g, "").length < 6 || !email.trim()))
-              }
-              variant="primary"
-            >
-              {authLoading ? "Подождите..." : mode === "login" && loginMethod === "code" ? "Войти по коду" : authTitle}
-            </GreyButton>
+            <div className="flex w-full justify-center pt-1">
+              <GreyButton
+                onClick={() => submitAuth()}
+                disabled={
+                  authLoading || otpCode.replace(/\s/g, "").length < 6 || !email.trim()
+                }
+                variant="primary"
+              >
+                {authLoading
+                  ? uiLanguage === "en"
+                    ? "Please wait…"
+                    : "Подождите…"
+                  : uiLanguage === "en"
+                    ? "Sign in with code"
+                    : "Войти по коду"}
+              </GreyButton>
+            </div>
+
+            <div className="flex w-full justify-center pt-4">
+              <a
+                href={getApiUrl("/docs")}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-sm text-[var(--k-text-muted)] underline-offset-2 transition-colors hover:text-[var(--k-text)] hover:underline"
+              >
+                {uiLanguage === "en" ? "API documentation (Swagger)" : "Документация API (Swagger)"}
+              </a>
+            </div>
           </div>
         </div>
       </div>
+    </>
     );
   }
 
   return (
+    <>
     <AppShell
-      spaces={spaces}
-      projects={projects}
-      boards={boards}
+      organizations={sidebarOrganizations}
+      activeOrganizationId={activeOrganizationId}
+      onSelectOrganization={(orgId) => {
+        setActiveOrganizationId(orgId);
+        setActiveBoardId(null);
+        setKaitenTab("lists");
+      }}
+      canRenameOrganization={(organizationId) => {
+        const m = orgMemberships.find((x) => normalizeOrgIdKey(x.organization_id) === normalizeOrgIdKey(organizationId));
+        return m?.role === "manager" || m?.role === "admin";
+      }}
+      onRenameOrganization={handleRenameOrganization}
+      organizationMembers={sidebarOrgMembers}
+      organizationMembersLoading={sidebarOrgMembersLoading}
+      currentUserId={currentUserId}
+      onOpenDirectMessage={(m) =>
+        setDmPeer({
+          id: m.id,
+          full_name: m.full_name,
+          email: m.email,
+          role: m.role,
+        })
+      }
+      spaces={visibleSpaces}
+      projects={visibleProjects}
+      boards={visibleBoards}
       activeSpaceId={activeSpaceId}
       activeProjectId={activeProjectId}
       activeBoardId={activeBoardId}
@@ -1485,6 +2347,10 @@ export default function AppHomePageImplGray() {
       activeTabId={kaitenTab}
       onTabChange={setKaitenTab}
       notificationCount={unreadNotificationsCount}
+      directMessageUnreadCount={dmUnreadCount}
+      onDirectMessagesClick={() => {
+        if (token?.access && activeOrganizationId) fetchDmUnread(token.access, activeOrganizationId).catch(() => {});
+      }}
       notifications={notifications}
       onOpenNotifications={() => {
         if (!token) return;
@@ -1510,7 +2376,7 @@ export default function AppHomePageImplGray() {
       onViewModeChange={setViewMode}
       onCreateClick={canManageBoard ? handleOpenCreateTask : undefined}
       onCreateSpaceClick={() => setCreateSpaceOpen(true)}
-      onCreateBoardClick={canManageBoard ? handleCreateBoard : undefined}
+      onCreateBoardClick={canManageBoard ? openCreateBoardDialog : undefined}
       onAddAction={(action) => {
         if (action === "folder") {
           if (!canManageBoard) {
@@ -1521,8 +2387,8 @@ export default function AppHomePageImplGray() {
           return;
         }
         if (action === "space") {
-          if (!(effectiveRole === "lead" || effectiveRole === "admin")) {
-            setAuthError(uiLanguage === "en" ? "Only lead/admin can create spaces" : "Создавать пространства могут только lead/admin");
+          if (!(effectiveRole === "manager" || effectiveRole === "admin")) {
+            setAuthError(uiLanguage === "en" ? "Only manager/admin can create spaces" : "Создавать пространства могут только менеджер и администратор");
             return;
           }
           setCreateSpaceOpen(true);
@@ -1533,7 +2399,7 @@ export default function AppHomePageImplGray() {
             setAuthError(uiLanguage === "en" ? "Only manager and above can create boards" : "Создавать доски могут только менеджер и выше");
             return;
           }
-          handleCreateBoard();
+          openCreateBoardDialog();
           return;
         }
         if (action === "document") {
@@ -1546,7 +2412,7 @@ export default function AppHomePageImplGray() {
             setAuthError(uiLanguage === "en" ? "Only manager and above can create boards" : "Создавать доски могут только менеджер и выше");
             return;
           }
-          handleCreateBoard();
+          openCreateBoardDialog();
           return;
         }
       }}
@@ -1565,13 +2431,25 @@ export default function AppHomePageImplGray() {
         setKaitenTab("administration");
       }}
       onOpenTemplates={() => setKaitenTab("settings")}
+      onOpenTaskFilters={(el) => {
+        setKaitenTab("lists");
+        setFiltersAnchorEl(el);
+      }}
       onLogout={() => {
         setToken(null);
         setActiveSpaceId(null);
+        setActiveOrganizationId(null);
         setActiveProjectId(null);
         setActiveBoardId(null);
         localStorage.removeItem(ACCESS_STORAGE_KEY);
         localStorage.removeItem(REFRESH_STORAGE_KEY);
+        try {
+          localStorage.removeItem(LAST_ACTIVE_ORG_STORAGE_KEY);
+        } catch {
+          // ignore
+        }
+        setCurrentUserId(null);
+        setDmPeer(null);
       }}
     >
       <div
@@ -1581,24 +2459,130 @@ export default function AppHomePageImplGray() {
         aria-label="Контент приложения"
       >
         {kaitenTab === "reports" && (
-          <div className="flex items-center justify-center flex-1 text-[var(--k-text-muted)] text-sm">
-            Отчёты будут доступны в следующей версии.
-          </div>
-        )}
-
-        {kaitenTab === "archive" && (
-          <div className="flex items-center justify-center flex-1 text-[var(--k-text-muted)] text-sm">
-            Архив карточек будет доступен в следующей версии.
-          </div>
-        )}
-
-        {kaitenTab === "filters" && (
           <div
             className="flex flex-col flex-1 min-h-0 rounded-2xl shadow-sm p-4 overflow-auto m-4"
             style={{ background: uiColors.cardBg, border: `1px solid ${uiColors.border}` }}
           >
-            <div className="text-[var(--k-text-muted)] text-xs font-semibold uppercase tracking-wide mb-3">Сохранённые фильтры</div>
-            <p className="text-[var(--k-text-muted)] text-sm">Пока сохранённых фильтров нет. Создавайте фильтры из панели доски.</p>
+            <div className="font-bold text-[var(--k-text)] text-lg mb-1">
+              {uiLanguage === "en" ? "Reports" : "Отчёты"}
+            </div>
+            <p className="text-[var(--k-text-muted)] text-sm mb-4">
+              {uiLanguage === "en"
+                ? "Summary for the board selected in the sidebar (Tasks tab)."
+                : "Сводка по доске, выбранной в левом меню (вкладка «Задачи»)."}
+            </p>
+            {!activeBoardId || !reportStats ? (
+              <div className="text-[var(--k-text-muted)] text-sm">
+                {uiLanguage === "en" ? "Select a board in the left menu." : "Выберите доску в меню слева."}
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div className="rounded-xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] p-4">
+                  <div className="text-xs uppercase tracking-wide text-[var(--k-text-muted)] mb-1">
+                    {uiLanguage === "en" ? "Board" : "Доска"}
+                  </div>
+                  <div className="text-[var(--k-text)] font-semibold text-lg">{reportStats.boardName}</div>
+                  <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+                    <div>
+                      <span className="text-[var(--k-text-muted)]">{uiLanguage === "en" ? "Cards total" : "Всего карточек"}: </span>
+                      <span className="text-[var(--k-text)] font-medium">{reportStats.total}</span>
+                    </div>
+                    <div>
+                      <span className="text-[var(--k-text-muted)]">{uiLanguage === "en" ? "Story points (sum)" : "СП (сумма)"}: </span>
+                      <span className="text-[var(--k-text)] font-medium">{reportStats.estimateSum}</span>
+                    </div>
+                  </div>
+                </div>
+                <div className="rounded-xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] p-4 overflow-x-auto">
+                  <div className="text-xs uppercase tracking-wide text-[var(--k-text-muted)] mb-2">
+                    {uiLanguage === "en" ? "By column" : "По колонкам"}
+                  </div>
+                  <table className="w-full text-sm text-left">
+                    <thead>
+                      <tr className="border-b border-[var(--k-border)] text-[var(--k-text-muted)]">
+                        <th className="py-2 pr-2">{uiLanguage === "en" ? "Column" : "Колонка"}</th>
+                        <th className="py-2 pr-2">{uiLanguage === "en" ? "Cards" : "Карточек"}</th>
+                        <th className="py-2">{uiLanguage === "en" ? "Type" : "Тип"}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {reportStats.byColumn.map((row, colIdx) => (
+                        <tr key={`${row.name}-${colIdx}`} className="border-b border-[var(--k-border)]/60">
+                          <td className="py-2 pr-2 text-[var(--k-text)]">{row.name}</td>
+                          <td className="py-2 pr-2 text-[var(--k-text)]">{row.count}</td>
+                          <td className="py-2 text-[var(--k-text-muted)]">
+                            {row.is_done ? (uiLanguage === "en" ? "Done" : "Готово") : uiLanguage === "en" ? "Active" : "Активные"}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {kaitenTab === "archive" && (
+          <div
+            className="flex flex-col flex-1 min-h-0 rounded-2xl shadow-sm p-4 overflow-auto m-4"
+            style={{ background: uiColors.cardBg, border: `1px solid ${uiColors.border}` }}
+          >
+            <div className="font-bold text-[var(--k-text)] text-lg mb-1">
+              {uiLanguage === "en" ? "Archive" : "Архив"}
+            </div>
+            <p className="text-[var(--k-text-muted)] text-sm mb-4">
+              {uiLanguage === "en"
+                ? "Cards archived by manager/admin across all boards in this space."
+                : "Карточки, отправленные в архив менеджером/админом, на всех досках текущего пространства."}
+            </p>
+            {!activeSpaceId ? (
+              <div className="text-[var(--k-text-muted)] text-sm">
+                {uiLanguage === "en" ? "No space selected." : "Пространство не выбрано."}
+              </div>
+            ) : archiveLoading ? (
+              <div className="text-[var(--k-text-muted)] text-sm">{uiLanguage === "en" ? "Loading…" : "Загрузка…"}</div>
+            ) : archiveCards.length === 0 ? (
+              <div className="text-[var(--k-text-muted)] text-sm">
+                {uiLanguage === "en" ? "No archived cards." : "Нет карточек в архиве."}
+              </div>
+            ) : (
+              <div className="rounded-xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] overflow-x-auto">
+                <table className="w-full text-sm text-left">
+                  <thead>
+                    <tr className="border-b border-[var(--k-border)] text-[var(--k-text-muted)]">
+                      <th className="py-2 px-3">{uiLanguage === "en" ? "Card" : "Карточка"}</th>
+                      <th className="py-2 px-3">{uiLanguage === "en" ? "Board" : "Доска"}</th>
+                      <th className="py-2 px-3">{uiLanguage === "en" ? "Column" : "Колонка"}</th>
+                      <th className="py-2 px-3">{uiLanguage === "en" ? "Effort" : "Трудозатраты"}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {archiveCards.map((c) => (
+                      <tr key={c.id} className="border-b border-[var(--k-border)]/60 hover:bg-[var(--k-page-bg)]">
+                        <td className="py-2 px-3">
+                          <button
+                            type="button"
+                            className="text-left text-[var(--k-text)] underline-offset-2 hover:underline"
+                            onClick={() => {
+                              setKaitenTab("lists");
+                              void openCardDetails(c.id);
+                            }}
+                          >
+                            {c.title}
+                          </button>
+                        </td>
+                        <td className="py-2 px-3 text-[var(--k-text-muted)]">{c.board_name}</td>
+                        <td className="py-2 px-3 text-[var(--k-text-muted)]">{c.column_name}</td>
+                        <td className="py-2 px-3 text-[var(--k-text-muted)]">
+                          {formatEffortSeconds(c.total_effort_seconds, uiLanguage)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
         )}
 
@@ -1611,7 +2595,7 @@ export default function AppHomePageImplGray() {
             ) : (
               <>
                 {/* Канбан-доска */}
-                {viewMode === "board" && (
+                {viewMode === "board" && access && (
                   <div className="flex-1 min-h-0 overflow-hidden">
                     <KanbanBoard
                       boardId={activeBoardId}
@@ -1640,13 +2624,6 @@ export default function AppHomePageImplGray() {
               </>
             )}
 
-            <FiltersPopover
-              anchorEl={filtersAnchorEl}
-              open={Boolean(filtersAnchorEl)}
-              onClose={() => setFiltersAnchorEl(null)}
-              filters={filters}
-              onChangeFilters={setFilters}
-            />
           </div>
         )}
 
@@ -2486,19 +3463,91 @@ export default function AppHomePageImplGray() {
                   onChange={(e) => setNewUserRole(e.target.value as OrgUser["role"])}
                   className="rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] px-3 py-2 text-[var(--k-text)] outline-none"
                 >
-                  <option value="user">{uiLanguage === "en" ? "User" : "Пользователь"}</option>
                   <option value="executor">{uiLanguage === "en" ? "Executor" : "Исполнитель"}</option>
                   <option value="manager">{uiLanguage === "en" ? "Manager" : "Менеджер"}</option>
-                  <option value="lead">{uiLanguage === "en" ? "Lead" : "Руководитель"}</option>
                   <option value="admin">{uiLanguage === "en" ? "Admin" : "Администратор"}</option>
                 </select>
+                {adminOrganizations.length >= 1 ? (
+                  <label className="md:col-span-2 flex flex-col gap-1">
+                    <span className="text-xs text-[var(--k-text-muted)]">
+                      {uiLanguage === "en" ? "Organization" : "Организация"}
+                    </span>
+                    <select
+                      value={newUserOrganizationId ?? ""}
+                      onChange={(e) => setNewUserOrganizationId(e.target.value || null)}
+                      className="rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] px-3 py-2 text-[var(--k-text)] outline-none"
+                    >
+                      {adminOrganizations.map((m) => (
+                        <option key={m.organization_id} value={m.organization_id}>
+                          {m.organization_name || m.organization_id}
+                        </option>
+                      ))}
+                    </select>
+                    {!hasBsvrOrganization && token ? (
+                      <div className="mt-2">
+                      <GreyButton
+                        variant="soft"
+                        disabled={createBsvrOrgBusy}
+                        onClick={async () => {
+                          if (!token) return;
+                          setCreateBsvrOrgBusy(true);
+                          setOrgUsersError(null);
+                          setOrgUsersSuccess(null);
+                          try {
+                            const res = await fetch(getApiUrl("/api/auth/organizations"), {
+                              method: "POST",
+                              headers: {
+                                Authorization: `Bearer ${token.access}`,
+                                "Content-Type": "application/json",
+                              },
+                              body: JSON.stringify({ name: "БСВР" }),
+                            });
+                            const data = (await res.json().catch(() => ({}))) as { id?: string; detail?: string };
+                            if (!res.ok) {
+                              throw new Error(
+                                typeof data.detail === "string" ? data.detail : "Не удалось создать организацию",
+                              );
+                            }
+                            await fetchCurrentUser(token.access);
+                            await fetchSpaces(token.access);
+                            if (data.id) {
+                              setNewUserOrganizationId(data.id);
+                              setActiveOrganizationId(data.id);
+                            }
+                            setOrgUsersSuccess(
+                              uiLanguage === "en" ? "Organization «BSVR» has been created" : "Организация «БСВР» создана",
+                            );
+                          } catch (e: any) {
+                            setOrgUsersError(e?.message ?? "Ошибка создания организации");
+                          } finally {
+                            setCreateBsvrOrgBusy(false);
+                          }
+                        }}
+                      >
+                        {createBsvrOrgBusy
+                          ? uiLanguage === "en"
+                            ? "Creating…"
+                            : "Создание…"
+                          : uiLanguage === "en"
+                            ? "Add organization «BSVR» to the list"
+                            : "Добавить организацию «БСВР» в список"}
+                      </GreyButton>
+                      </div>
+                    ) : null}
+                  </label>
+                ) : null}
               </div>
               <div className="mt-3 flex justify-end">
                 <GreyButton
                   variant="primary"
-                  disabled={newUserBusy || !newUserEmail.trim() || newUserPassword.trim().length < 8}
+                  disabled={
+                    newUserBusy ||
+                    !newUserEmail.trim() ||
+                    newUserPassword.trim().length < 8 ||
+                    !newUserOrganizationId
+                  }
                   onClick={async () => {
-                    if (!token || !activeSpaceId) return;
+                    if (!token || !newUserOrganizationId) return;
                     setNewUserBusy(true);
                     setOrgUsersError(null);
                     setOrgUsersSuccess(null);
@@ -2507,14 +3556,16 @@ export default function AppHomePageImplGray() {
                         method: "POST",
                         headers: {
                           Authorization: `Bearer ${token.access}`,
-                          "X-Space-Id": activeSpaceId,
+                          "X-Organization-Id": newUserOrganizationId,
                           "Content-Type": "application/json",
+                          ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
                         },
                         body: JSON.stringify({
                           email: newUserEmail.trim(),
                           password: newUserPassword,
                           full_name: newUserFullName.trim(),
                           role: newUserRole,
+                          organization_id: newUserOrganizationId,
                         }),
                       });
                       const data = await res.json().catch(() => ({}));
@@ -2522,8 +3573,11 @@ export default function AppHomePageImplGray() {
                       setNewUserEmail("");
                       setNewUserPassword("");
                       setNewUserFullName("");
-                      setNewUserRole("user");
-                      await fetchOrganizationUsers(token.access, activeSpaceId);
+                      setNewUserRole("executor");
+                      await fetchOrganizationUsers(token.access, {
+                        organizationId: newUserOrganizationId || activeOrganizationId,
+                        spaceId: activeSpaceId,
+                      });
                     } catch (e: any) {
                       setOrgUsersError(e?.message ?? "Ошибка создания пользователя");
                     } finally {
@@ -2554,6 +3608,30 @@ export default function AppHomePageImplGray() {
                       <div className="flex-1 min-w-0">
                         <div className="text-[var(--k-text)] font-semibold truncate">{u.full_name || u.email}</div>
                         <div className="text-[var(--k-text-muted)] text-sm truncate">{u.email}</div>
+                        {u.memberships && u.memberships.length > 0 ? (
+                          <div className="text-[var(--k-text-muted)] text-xs mt-1.5">
+                            <div className="font-medium text-[var(--k-text)] mb-0.5">
+                              {uiLanguage === "en" ? "Organizations" : "Организации"}
+                            </div>
+                            <ul className="space-y-0.5 list-none pl-0 m-0">
+                              {u.memberships.map((m) => (
+                                <li key={m.organization_id} className="flex flex-wrap gap-x-1.5 gap-y-0 items-baseline">
+                                  <span className="text-[var(--k-text)] font-medium">
+                                    {m.organization_name?.trim() || m.organization_id}
+                                  </span>
+                                  <span className="text-[var(--k-text-muted)]">
+                                    ({formatOrgMemberRoleLabel(m.role, uiLanguage)})
+                                  </span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        ) : activeOrganizationName ? (
+                          <div className="text-[var(--k-text-muted)] text-xs mt-1">
+                            {uiLanguage === "en" ? "Organization: " : "Организация: "}
+                            <span className="text-[var(--k-text)] font-medium">{activeOrganizationName}</span>
+                          </div>
+                        ) : null}
                         <div className="text-[var(--k-text-muted)] text-xs mt-1">
                           {u.last_login
                             ? (uiLanguage === "en" ? "Last sign-in: " : "Последний вход: ") +
@@ -2570,17 +3648,75 @@ export default function AppHomePageImplGray() {
                             setAdminEditUser(u);
                             setAdminEditFullName(u.full_name || "");
                             setAdminEditEmail(u.email);
+                            setAdminAddMembershipRole("executor");
                             setOrgUsersError(null);
                             setOrgUsersSuccess(null);
                           }}
                         >
                           {uiLanguage === "en" ? "Edit" : "Редактировать"}
                         </GreyButton>
+                        {currentUserId && u.id !== currentUserId ? (
+                          <GreyButton
+                            variant="soft"
+                            disabled={userDeleteBusyId === u.id}
+                            onClick={async () => {
+                              if (!token || !activeOrganizationId) return;
+                              const ok = window.confirm(
+                                uiLanguage === "en"
+                                  ? `Permanently delete account ${u.email}? This cannot be undone. The user will be removed from all organizations and all related data will be deleted or unlinked.`
+                                  : `Полностью удалить учётную запись ${u.email}? Это действие необратимо: пользователь будет удалён из всех организаций, связанные данные будут удалены или отвязаны.`,
+                              );
+                              if (!ok) return;
+                              setUserDeleteBusyId(u.id);
+                              setOrgUsersError(null);
+                              setOrgUsersSuccess(null);
+                              try {
+                                const res = await fetch(getApiUrl(`/api/auth/users/${u.id}`), {
+                                  method: "DELETE",
+                                  headers: {
+                                    Authorization: `Bearer ${token.access}`,
+                                    "X-Organization-Id": activeOrganizationId,
+                                    ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
+                                  },
+                                });
+                                const data = await res.json().catch(() => ({}));
+                                if (!res.ok) {
+                                  throw new Error(
+                                    typeof data?.detail === "string"
+                                      ? data.detail
+                                      : uiLanguage === "en"
+                                        ? "Could not delete user"
+                                        : "Не удалось удалить пользователя",
+                                  );
+                                }
+                                setOrgUsersSuccess(
+                                  uiLanguage === "en" ? "User account deleted" : "Учётная запись пользователя удалена",
+                                );
+                                await fetchOrganizationUsers(token.access, {
+                                  organizationId: activeOrganizationId,
+                                  spaceId: activeSpaceId,
+                                });
+                              } catch (e: any) {
+                                setOrgUsersError(e?.message ?? "Ошибка удаления");
+                              } finally {
+                                setUserDeleteBusyId(null);
+                              }
+                            }}
+                          >
+                            {userDeleteBusyId === u.id
+                              ? uiLanguage === "en"
+                                ? "Deleting…"
+                                : "Удаление…"
+                              : uiLanguage === "en"
+                                ? "Delete account"
+                                : "Удалить учётную запись"}
+                          </GreyButton>
+                        ) : null}
                         <GreyButton
                           variant="soft"
                           disabled={userCodeBusyId === u.id}
                           onClick={async () => {
-                            if (!token || !activeSpaceId) return;
+                            if (!token || !activeOrganizationId) return;
                             setUserCodeBusyId(u.id);
                             setOrgUsersError(null);
                             setOrgUsersSuccess(null);
@@ -2589,7 +3725,8 @@ export default function AppHomePageImplGray() {
                                 method: "POST",
                                 headers: {
                                   Authorization: `Bearer ${token.access}`,
-                                  "X-Space-Id": activeSpaceId,
+                                  "X-Organization-Id": activeOrganizationId,
+                                  ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
                                 },
                               });
                               const data = await res.json().catch(() => ({}));
@@ -2625,14 +3762,15 @@ export default function AppHomePageImplGray() {
                         <select
                           value={u.role}
                           onChange={async (e) => {
-                            if (!token || !activeSpaceId) return;
+                            if (!token || !activeOrganizationId) return;
                             const nextRole = e.target.value as OrgUser["role"];
                             try {
                               const res = await fetch(getApiUrl(`/api/auth/users/${u.id}/role`), {
                                 method: "PATCH",
                                 headers: {
                                   Authorization: `Bearer ${token.access}`,
-                                  "X-Space-Id": activeSpaceId,
+                                  "X-Organization-Id": activeOrganizationId,
+                                  ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
                                   "Content-Type": "application/json",
                                 },
                                 body: JSON.stringify({ role: nextRole }),
@@ -2646,10 +3784,8 @@ export default function AppHomePageImplGray() {
                           }}
                           className="rounded-xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] px-3 py-2 text-[var(--k-text)] outline-none min-w-[160px]"
                         >
-                          <option value="user">{uiLanguage === "en" ? "User" : "Пользователь"}</option>
                           <option value="executor">{uiLanguage === "en" ? "Executor" : "Исполнитель"}</option>
                           <option value="manager">{uiLanguage === "en" ? "Manager" : "Менеджер"}</option>
-                          <option value="lead">{uiLanguage === "en" ? "Lead" : "Руководитель"}</option>
                           <option value="admin">{uiLanguage === "en" ? "Admin" : "Администратор"}</option>
                         </select>
                       </div>
@@ -2665,11 +3801,13 @@ export default function AppHomePageImplGray() {
             {adminEditUser ? (
               <div
                 className="fixed inset-0 z-[160] flex items-center justify-center p-4 bg-black/50"
-                onClick={() => !adminEditBusy && setAdminEditUser(null)}
+                onClick={() =>
+                  !adminEditBusy && !adminAddMembershipBusy && !adminMembershipRoleBusyOrgId && setAdminEditUser(null)
+                }
                 role="presentation"
               >
                 <div
-                  className="w-full max-w-md rounded-2xl border border-[var(--k-border)] p-5 shadow-2xl"
+                  className="w-full max-w-lg rounded-2xl border border-[var(--k-border)] p-5 shadow-2xl max-h-[90vh] overflow-y-auto"
                   style={{ background: uiColors.cardBg }}
                   onClick={(e) => e.stopPropagation()}
                   role="dialog"
@@ -2698,15 +3836,265 @@ export default function AppHomePageImplGray() {
                       />
                     </label>
                   </div>
+                  <div className="rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] p-3 space-y-2 mt-3">
+                    <div className="text-xs font-semibold text-[var(--k-text)]">
+                      {uiLanguage === "en" ? "Organizations (where you are admin)" : "Организации (где вы администратор)"}
+                    </div>
+                    {adminMembershipsLoading ? (
+                      <div className="text-sm text-[var(--k-text-muted)]">
+                        {uiLanguage === "en" ? "Loading…" : "Загрузка…"}
+                      </div>
+                    ) : (
+                      <ul className="space-y-1.5 text-sm">
+                        {adminUserMemberships.map((m) => (
+                          <li
+                            key={m.organization_id}
+                            className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 rounded-lg border border-[var(--k-border)] bg-[var(--k-surface-bg)] px-2 py-1.5"
+                          >
+                            <span className="text-[var(--k-text)] truncate min-w-0 text-sm">
+                              {m.organization_name || m.organization_id}
+                            </span>
+                            <select
+                              value={m.role}
+                              disabled={
+                                Boolean(adminMembershipRoleBusyOrgId) ||
+                                adminAddMembershipBusy ||
+                                adminEditBusy ||
+                                !token ||
+                                !activeOrganizationId
+                              }
+                              onChange={async (e) => {
+                                const next = e.target.value as OrgUser["role"];
+                                if (next === m.role || !token || !activeOrganizationId || !adminEditUser) return;
+                                setAdminMembershipRoleBusyOrgId(m.organization_id);
+                                setOrgUsersError(null);
+                                setOrgUsersSuccess(null);
+                                try {
+                                  const res = await fetch(
+                                    getApiUrl(`/api/auth/users/${adminEditUser.id}/memberships`),
+                                    {
+                                      method: "POST",
+                                      headers: {
+                                        Authorization: `Bearer ${token.access}`,
+                                        "X-Organization-Id": activeOrganizationId,
+                                        ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
+                                        "Content-Type": "application/json",
+                                      },
+                                      body: JSON.stringify({
+                                        organization_id: m.organization_id,
+                                        role: next,
+                                      }),
+                                    },
+                                  );
+                                  const data = (await res.json().catch(() => ({}))) as { detail?: string };
+                                  if (!res.ok) throw new Error(data?.detail ?? "Не удалось изменить роль");
+                                  const reload = await fetch(
+                                    getApiUrl(`/api/auth/users/${adminEditUser.id}/memberships`),
+                                    {
+                                      headers: {
+                                        Authorization: `Bearer ${token.access}`,
+                                        "X-Organization-Id": activeOrganizationId,
+                                        ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
+                                      },
+                                    },
+                                  );
+                                  const list = (await reload.json().catch(() => [])) as Array<{
+                                    organization_id: string;
+                                    organization_name: string;
+                                    role: string;
+                                  }>;
+                                  if (reload.ok && Array.isArray(list)) {
+                                    setAdminUserMemberships(
+                                      list.map((x) => ({
+                                        organization_id: x.organization_id,
+                                        organization_name: x.organization_name,
+                                        role: (x.role as OrgUser["role"]) ?? "executor",
+                                      })),
+                                    );
+                                  }
+                                  setOrgUsersSuccess(
+                                    uiLanguage === "en" ? "Role updated" : "Роль обновлена",
+                                  );
+                                  if (
+                                    normalizeOrgIdKey(m.organization_id) === normalizeOrgIdKey(activeOrganizationId)
+                                  ) {
+                                    await fetchOrganizationUsers(token.access, {
+                                      organizationId: activeOrganizationId,
+                                      spaceId: activeSpaceId,
+                                    }).catch(() => {});
+                                  }
+                                } catch (err: unknown) {
+                                  setOrgUsersError(err instanceof Error ? err.message : "Ошибка");
+                                } finally {
+                                  setAdminMembershipRoleBusyOrgId(null);
+                                }
+                              }}
+                              className="shrink-0 min-w-[160px] rounded-lg border border-[var(--k-border)] bg-[var(--k-page-bg)] px-2 py-1.5 text-[var(--k-text)] outline-none text-xs"
+                            >
+                              <option value="executor">{uiLanguage === "en" ? "Executor" : "Исполнитель"}</option>
+                              <option value="manager">{uiLanguage === "en" ? "Manager" : "Менеджер"}</option>
+                              <option value="admin">{uiLanguage === "en" ? "Admin" : "Администратор"}</option>
+                            </select>
+                          </li>
+                        ))}
+                        {!adminUserMemberships.length ? (
+                          <li className="text-[var(--k-text-muted)] text-xs">
+                            {uiLanguage === "en"
+                              ? "No shared organizations yet, or the user is only in orgs where you are not admin."
+                              : "Пока нет общих организаций или пользователь только там, где вы не администратор."}
+                          </li>
+                        ) : null}
+                      </ul>
+                    )}
+                    {orgsAvailableToAddForAdminEdit.length > 0 ? (
+                      <div className="pt-2 border-t border-[var(--k-border)] space-y-2">
+                        <div className="text-xs text-[var(--k-text-muted)]">
+                          {uiLanguage === "en" ? "Add user to organization" : "Добавить пользователя в организацию"}
+                        </div>
+                        <div className="flex flex-col sm:flex-row flex-wrap gap-2 items-stretch sm:items-end">
+                          <label className="flex-1 min-w-[140px]">
+                            <div className="text-[10px] text-[var(--k-text-muted)] mb-0.5">
+                              {uiLanguage === "en" ? "Organization" : "Организация"}
+                            </div>
+                            <select
+                              value={adminAddMembershipOrgId}
+                              onChange={(e) => setAdminAddMembershipOrgId(e.target.value)}
+                              disabled={Boolean(adminMembershipRoleBusyOrgId)}
+                              className="w-full rounded-xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] px-3 py-2 text-[var(--k-text)] outline-none text-sm disabled:opacity-60"
+                            >
+                              {orgsAvailableToAddForAdminEdit.map((o) => (
+                                <option key={o.organization_id} value={o.organization_id}>
+                                  {o.organization_name || o.organization_id}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label className="min-w-[140px]">
+                            <div className="text-[10px] text-[var(--k-text-muted)] mb-0.5">
+                              {uiLanguage === "en" ? "Role" : "Роль"}
+                            </div>
+                            <select
+                              value={adminAddMembershipRole}
+                              onChange={(e) => setAdminAddMembershipRole(e.target.value as OrgUser["role"])}
+                              disabled={Boolean(adminMembershipRoleBusyOrgId)}
+                              className="w-full rounded-xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] px-3 py-2 text-[var(--k-text)] outline-none text-sm disabled:opacity-60"
+                            >
+                              <option value="executor">{uiLanguage === "en" ? "Executor" : "Исполнитель"}</option>
+                              <option value="manager">{uiLanguage === "en" ? "Manager" : "Менеджер"}</option>
+                              <option value="admin">{uiLanguage === "en" ? "Admin" : "Администратор"}</option>
+                            </select>
+                          </label>
+                          <GreyButton
+                            variant="soft"
+                            disabled={
+                              adminAddMembershipBusy ||
+                              adminEditBusy ||
+                              Boolean(adminMembershipRoleBusyOrgId) ||
+                              !adminAddMembershipOrgId ||
+                              !token ||
+                              !activeOrganizationId
+                            }
+                            onClick={async () => {
+                              if (!token || !activeOrganizationId || !adminEditUser || !adminAddMembershipOrgId) return;
+                              setAdminAddMembershipBusy(true);
+                              setOrgUsersError(null);
+                              setOrgUsersSuccess(null);
+                              try {
+                                const res = await fetch(
+                                  getApiUrl(`/api/auth/users/${adminEditUser.id}/memberships`),
+                                  {
+                                    method: "POST",
+                                    headers: {
+                                      Authorization: `Bearer ${token.access}`,
+                                      "X-Organization-Id": activeOrganizationId,
+                                      ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
+                                      "Content-Type": "application/json",
+                                    },
+                                    body: JSON.stringify({
+                                      organization_id: adminAddMembershipOrgId,
+                                      role: adminAddMembershipRole,
+                                    }),
+                                  },
+                                );
+                                const data = (await res.json().catch(() => ({}))) as { detail?: string };
+                                if (!res.ok) throw new Error(data?.detail ?? "Не удалось добавить в организацию");
+                                const reload = await fetch(
+                                  getApiUrl(`/api/auth/users/${adminEditUser.id}/memberships`),
+                                  {
+                                    headers: {
+                                      Authorization: `Bearer ${token.access}`,
+                                      "X-Organization-Id": activeOrganizationId,
+                                      ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
+                                    },
+                                  },
+                                );
+                                const list = (await reload.json().catch(() => [])) as Array<{
+                                  organization_id: string;
+                                  organization_name: string;
+                                  role: string;
+                                }>;
+                                if (reload.ok && Array.isArray(list)) {
+                                  setAdminUserMemberships(
+                                    list.map((x) => ({
+                                      organization_id: x.organization_id,
+                                      organization_name: x.organization_name,
+                                      role: (x.role as OrgUser["role"]) ?? "executor",
+                                    })),
+                                  );
+                                }
+                                setOrgUsersSuccess(
+                                  uiLanguage === "en" ? "Membership updated" : "Участие в организации обновлено",
+                                );
+                                if (normalizeOrgIdKey(adminAddMembershipOrgId) === normalizeOrgIdKey(activeOrganizationId)) {
+                                  await fetchOrganizationUsers(token.access, {
+                                    organizationId: activeOrganizationId,
+                                    spaceId: activeSpaceId,
+                                  }).catch(() => {});
+                                }
+                              } catch (e: unknown) {
+                                setOrgUsersError(e instanceof Error ? e.message : "Ошибка");
+                              } finally {
+                                setAdminAddMembershipBusy(false);
+                              }
+                            }}
+                          >
+                            {adminAddMembershipBusy
+                              ? uiLanguage === "en"
+                                ? "Adding…"
+                                : "Добавление…"
+                              : uiLanguage === "en"
+                                ? "Add"
+                                : "Добавить"}
+                          </GreyButton>
+                        </div>
+                      </div>
+                    ) : !adminMembershipsLoading && adminOrganizations.length > 1 ? (
+                      <div className="text-xs text-[var(--k-text-muted)] pt-1">
+                        {uiLanguage === "en"
+                          ? "User is already a member of all organizations you administer."
+                          : "Пользователь уже состоит во всех организациях, где вы администратор."}
+                      </div>
+                    ) : null}
+                  </div>
                   <div className="mt-4 flex justify-end gap-2 flex-wrap">
-                    <GreyButton variant="soft" disabled={adminEditBusy} onClick={() => setAdminEditUser(null)}>
+                    <GreyButton
+                      variant="soft"
+                      disabled={adminEditBusy || adminAddMembershipBusy || Boolean(adminMembershipRoleBusyOrgId)}
+                      onClick={() => setAdminEditUser(null)}
+                    >
                       {uiLanguage === "en" ? "Cancel" : "Отмена"}
                     </GreyButton>
                     <GreyButton
                       variant="primary"
-                      disabled={adminEditBusy || !adminEditFullName.trim() || !adminEditEmail.trim()}
+                      disabled={
+                        adminEditBusy ||
+                        adminAddMembershipBusy ||
+                        Boolean(adminMembershipRoleBusyOrgId) ||
+                        !adminEditFullName.trim() ||
+                        !adminEditEmail.trim()
+                      }
                       onClick={async () => {
-                        if (!token || !activeSpaceId || !adminEditUser) return;
+                        if (!token || !activeOrganizationId || !adminEditUser) return;
                         setAdminEditBusy(true);
                         setOrgUsersError(null);
                         setOrgUsersSuccess(null);
@@ -2715,7 +4103,8 @@ export default function AppHomePageImplGray() {
                             method: "PATCH",
                             headers: {
                               Authorization: `Bearer ${token.access}`,
-                              "X-Space-Id": activeSpaceId,
+                              "X-Organization-Id": activeOrganizationId,
+                              ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
                               "Content-Type": "application/json",
                             },
                             body: JSON.stringify({
@@ -2761,6 +4150,16 @@ export default function AppHomePageImplGray() {
             ) : null}
           </div>
         )}
+
+        <FiltersPopover
+          anchorEl={filtersAnchorEl}
+          open={Boolean(filtersAnchorEl)}
+          onClose={() => setFiltersAnchorEl(null)}
+          filters={filters}
+          onChangeFilters={setFilters}
+          assigneeOptions={filterAssigneeOptions}
+          language={uiLanguage}
+        />
       </div>
 
       {tourOpen ? (
@@ -2818,54 +4217,7 @@ export default function AppHomePageImplGray() {
         <CardModal
           card={selectedCard}
           locale={uiLanguage}
-          onAddChecklist={async (title) => {
-            if (!token || !selectedCard) return;
-            const res = await fetch(getApiUrl(`/api/kanban/cards/${selectedCard.id}/checklists`), {
-              method: "POST",
-              headers: {
-                Authorization: `Bearer ${token.access}`,
-                "X-Space-Id": activeSpaceId || "",
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({ title }),
-            });
-            const data = await res.json().catch(() => ({}));
-            if (!res.ok) throw new Error(data?.detail ?? "Не удалось создать чек-лист");
-            await refreshSelectedCard();
-            if (data && typeof data === "object" && "id" in data && typeof data.id === "string") {
-              return { id: data.id };
-            }
-          }}
-          onAddChecklistItem={async (checklistId, title) => {
-            if (!token || !selectedCard) return;
-            const res = await fetch(getApiUrl(`/api/kanban/checklists/${checklistId}/items`), {
-              method: "POST",
-              headers: {
-                Authorization: `Bearer ${token.access}`,
-                "X-Space-Id": activeSpaceId || "",
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({ title }),
-            });
-            const data = await res.json().catch(() => ({}));
-            if (!res.ok) throw new Error(data?.detail ?? "Не удалось создать пункт");
-            await refreshSelectedCard();
-          }}
-          onToggleChecklistItem={async (itemId, isDone) => {
-            if (!token || !selectedCard) return;
-            const res = await fetch(getApiUrl(`/api/kanban/checklist-items/${itemId}`), {
-              method: "PATCH",
-              headers: {
-                Authorization: `Bearer ${token.access}`,
-                "X-Space-Id": activeSpaceId || "",
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({ is_done: isDone }),
-            });
-            const data = await res.json().catch(() => ({}));
-            if (!res.ok) throw new Error(data?.detail ?? "Не удалось обновить пункт");
-            await refreshSelectedCard();
-          }}
+          currentUserRole={effectiveRole}
           onAddComment={async (body) => {
             if (!token || !selectedCard) return;
             const res = await fetch(getApiUrl(`/api/kanban/cards/${selectedCard.id}/comments`), {
@@ -2911,9 +4263,39 @@ export default function AppHomePageImplGray() {
             if (!res.ok) throw new Error(data?.detail ?? "Не удалось добавить ссылку");
             await refreshSelectedCard();
           }}
+          onDeleteAttachment={
+            effectiveRole === "manager" || effectiveRole === "admin"
+              ? async (attachmentId) => {
+                  if (!token || !selectedCard) return;
+                  const res = await fetch(
+                    getApiUrl(`/api/kanban/cards/${selectedCard.id}/attachments/${attachmentId}`),
+                    {
+                      method: "DELETE",
+                      headers: {
+                        Authorization: `Bearer ${token.access}`,
+                        "X-Space-Id": activeSpaceId || "",
+                      },
+                    },
+                  );
+                  const data = await res.json().catch(() => ({}));
+                  if (!res.ok) throw new Error(data?.detail ?? "Не удалось удалить вложение");
+                  await refreshSelectedCard();
+                }
+              : undefined
+          }
           onClose={() => {
             setSelectedCard(null);
             setSelectedCardError(null);
+            deepLinkCardHandledRef.current = null;
+            if (typeof window !== "undefined") {
+              const params = new URLSearchParams(window.location.search);
+              if (params.has("card")) {
+                params.delete("card");
+                params.delete("board");
+                const q = params.toString();
+                router.replace(q ? `/app?${q}` : "/app", { scroll: false });
+              }
+            }
           }}
         />
       ) : null}
@@ -2930,6 +4312,7 @@ export default function AppHomePageImplGray() {
         onClose={() => setCreateSpaceOpen(false)}
         token={access}
         activeSpaceId={activeSpaceId}
+        activeOrganizationId={activeOrganizationId}
         refreshToken={token?.refresh}
         onTokensUpdated={(nextTokens) => {
           setToken(nextTokens);
@@ -2946,6 +4329,33 @@ export default function AppHomePageImplGray() {
         }}
         onCreated={handleSpaceCreated}
       />
+
+      {access && activeSpaceId ? (
+        <CreateBoardDialog
+          open={createBoardOpen}
+          onClose={() => setCreateBoardOpen(false)}
+          token={access}
+          spaceId={activeSpaceId}
+          projectId={newBoardProjectId}
+          refreshToken={token?.refresh}
+          defaultName={newBoardDefaultName}
+          language={uiLanguage}
+          onTokensUpdated={(nextTokens) => {
+            setToken(nextTokens);
+            localStorage.setItem(ACCESS_STORAGE_KEY, nextTokens.access);
+            if (nextTokens.refresh) localStorage.setItem(REFRESH_STORAGE_KEY, nextTokens.refresh);
+          }}
+          onAuthExpired={() => {
+            setToken(null);
+            setActiveSpaceId(null);
+            setActiveBoardId(null);
+            localStorage.removeItem(ACCESS_STORAGE_KEY);
+            localStorage.removeItem(REFRESH_STORAGE_KEY);
+            setAuthError("Сессия истекла. Войдите заново.");
+          }}
+          onCreated={handleBoardCreated}
+        />
+      ) : null}
 
       {access && activeSpaceId ? (
         <CreateFolderDialog
@@ -3036,5 +4446,20 @@ export default function AppHomePageImplGray() {
         />
       ) : null}
     </AppShell>
+    {access && activeOrganizationId ? (
+      <DirectMessageDrawer
+        open={Boolean(dmPeer)}
+        onClose={() => setDmPeer(null)}
+        peer={dmPeer}
+        token={access}
+        organizationId={activeOrganizationId}
+        currentUserId={currentUserId}
+        language={uiLanguage}
+        onConversationRead={() => {
+          if (token?.access && activeOrganizationId) fetchDmUnread(token.access, activeOrganizationId).catch(() => {});
+        }}
+      />
+    ) : null}
+    </>
   );
 }

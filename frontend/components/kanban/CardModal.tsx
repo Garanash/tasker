@@ -4,6 +4,7 @@ import React, { useEffect, useMemo, useRef, useState, useCallback } from "react"
 import StarIcon from "@mui/icons-material/Star";
 import StarBorderIcon from "@mui/icons-material/StarBorder";
 import AddIcon from "@mui/icons-material/Add";
+import IosShareOutlinedIcon from "@mui/icons-material/IosShareOutlined";
 import MoreVertIcon from "@mui/icons-material/MoreVert";
 import MenuBookOutlinedIcon from "@mui/icons-material/MenuBookOutlined";
 import BugReportOutlinedIcon from "@mui/icons-material/BugReportOutlined";
@@ -22,6 +23,7 @@ import {
 } from "@mui/material";
 import { normalizeTaskCardType, type TaskCardTypeId } from "./cardTaskTypes";
 import { MarkdownDescriptionPreview } from "./MarkdownDescriptionPreview";
+import type { AppRole } from "../kaiten/AppShell";
 
 export type CardDetailChecklistItem = {
   id: string;
@@ -81,9 +83,21 @@ export type CardDetail = {
     body: string;
     created_at: string;
   }>;
+  /** Время нахождения карточки в колонках по истории перемещений */
+  column_dwell_times?: Array<{ column_id: string; column_name: string; seconds: number }>;
 };
 
 const PARTICIPANT_FIELD_KEY = "participant_user_ids";
+
+function formatDurationSeconds(sec: number, locale: string): string {
+  if (!Number.isFinite(sec) || sec < 0) return "—";
+  if (sec < 60) return locale === "en" ? `${Math.round(sec)} s` : `${Math.round(sec)} сек`;
+  const m = Math.floor(sec / 60);
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  if (h > 0) return locale === "en" ? `${h} h ${rm} min` : `${h} ч ${rm} мин`;
+  return locale === "en" ? `${m} min` : `${m} мин`;
+}
 
 function parseParticipantUserIds(v: unknown): string[] {
   if (Array.isArray(v)) return v.map(String).filter(Boolean);
@@ -111,10 +125,8 @@ export function CardModal({
   onAddComment,
   onUploadAttachment,
   onAddAttachmentUrl,
-  onAddChecklist,
-  onAddChecklistItem,
-  onToggleChecklistItem,
   onUpdateCard,
+  onArchiveCard,
   onDeleteCard,
   onUpsertFieldValue,
   users = [],
@@ -123,15 +135,19 @@ export function CardModal({
   onToggleFavorite,
   onCreateRelatedCard,
   locale = "ru",
+  shareAppPath = "/app",
+  currentUserRole,
+  onDeleteAttachment,
 }: {
   card: CardDetail;
   onClose: () => void;
   onAddComment?: (body: string) => Promise<void>;
   onUploadAttachment?: (file: File) => Promise<void>;
   onAddAttachmentUrl?: (payload: { file_url: string; file_name?: string }) => Promise<void>;
-  onAddChecklist?: (title: string) => Promise<{ id: string } | void>;
-  onAddChecklistItem?: (checklistId: string, title: string) => Promise<void>;
-  onToggleChecklistItem?: (itemId: string, isDone: boolean) => Promise<void>;
+  /** Удаление вложений — только manager/admin (передаётся с родителя вместе с колбэком). */
+  onDeleteAttachment?: (attachmentId: string) => Promise<void>;
+  /** Роль текущего пользователя в организации (для «Время по стадиям» и UI удаления вложений). */
+  currentUserRole?: AppRole;
   onUpdateCard?: (patch: {
     title?: string;
     description?: string;
@@ -141,6 +157,7 @@ export function CardModal({
     estimate_points?: number | null;
     card_type?: string;
   }) => Promise<void>;
+  onArchiveCard?: () => Promise<void>;
   onDeleteCard?: () => Promise<void>;
   onUpsertFieldValue?: (payload: {
     key: string;
@@ -148,13 +165,16 @@ export function CardModal({
     value: unknown;
     field_type?: string;
   }) => Promise<void>;
-  users?: Array<{ id: string; email: string; full_name: string; role: "user" | "executor" | "manager" | "lead" | "admin" }>;
+  users?: Array<{ id: string; email: string; full_name: string; role: AppRole }>;
   availableColumns?: Array<{ id: string; name: string; is_done: boolean }>;
   isFavorite?: boolean;
   onToggleFavorite?: () => void;
   onCreateRelatedCard?: () => void;
   locale?: "ru" | "en";
+  /** Базовый путь приложения для ссылки «поделиться» (например /app) */
+  shareAppPath?: string;
 }) {
+  const canManagerOrAdmin = currentUserRole === "manager" || currentUserRole === "admin";
   const t =
     locale === "en"
       ? {
@@ -162,7 +182,7 @@ export function CardModal({
           done: "DONE",
           location: "Location",
           type: "Type",
-          participants: "Participants",
+          participants: "Responsibles",
           assignee: "Assignee",
           description: "Description",
           plan: "Plan",
@@ -170,12 +190,14 @@ export function CardModal({
           start: "Start",
           end: "End",
           points: "pts",
-          checklists: "Checklists",
-          noChecklists: "No checklists yet",
-          addChecklist: "Add checklist",
-          addItem: "Add item",
-          fields: "Fields",
-          noFields: "No fields yet",
+          shareTask: "Share task",
+          shareHint: "Link for colleagues signed in to the app.",
+          copyLink: "Copy",
+          copied: "Copied",
+          plannedDuration: "Planned duration",
+          plannedDurationDays: "{{n}} calendar day(s)",
+          plannedDurationInvalid: "End date is before start",
+          plannedDurationNeedDates: "Set start and end dates",
           attachments: "Attachments",
           upload: "Upload file",
           link: "Link",
@@ -202,7 +224,7 @@ export function CardModal({
           typeCard: "Card",
           typeBug: "Bug",
           typeFeature: "Feature",
-          addParticipant: "Add participant",
+          addParticipant: "Add responsible",
           blockCard: "Block card",
           blockReasonLabel: "Reason for blocking",
           blockReasonRequired: "Enter the reason — blocking is not allowed without it.",
@@ -212,24 +234,16 @@ export function CardModal({
           attachmentsLinks: "Attachments & links",
           addMenuDue: "Due date",
           addMenuTags: "Tags (quick edit)",
-          addMenuChecklist: "Checklist",
           addMenuLink: "Link (URL)",
           addMenuFile: "Upload file",
           addMenuParent: "Parent card ID",
           addMenuChild: "Create child card",
-          addMenuAcceptance: "Acceptance criteria checklist",
           addMenuGdrive: "Google Drive link",
           addMenuDropbox: "Dropbox link",
           addMenuNewField: "Custom field",
           addMenuTimeSpent: "Time spent (minutes)",
           addMenuSize: "Size",
           addMenuTimeline: "Timeline note",
-          checklistModalTitle: "New checklist",
-          checklistNameLabel: "Title",
-          checklistModeCheckbox: "Checkboxes",
-          checklistModePoll: "Poll (options)",
-          checklistOptionsPlaceholder: "Options, one per line (for poll)",
-          createChecklist: "Create",
           descEditTab: "Edit",
           descPreviewTab: "Preview",
           descMarkdownHint:
@@ -241,7 +255,7 @@ export function CardModal({
           done: "ГОТОВО",
           location: "Расположение",
           type: "Тип",
-          participants: "Участники",
+          participants: "Ответственные",
           assignee: "Ответственный",
           description: "Описание",
           plan: "План",
@@ -249,12 +263,14 @@ export function CardModal({
           start: "Старт",
           end: "Финиш",
           points: "очк.",
-          checklists: "Чек-листы",
-          noChecklists: "Пока нет чек-листов",
-          addChecklist: "Добавить чек-лист",
-          addItem: "Добавить пункт",
-          fields: "Поля",
-          noFields: "Пока нет полей",
+          shareTask: "Поделиться задачей",
+          shareHint: "Ссылка для коллег, уже зарегистрированных в системе (нужен вход).",
+          copyLink: "Копировать",
+          copied: "Скопировано",
+          plannedDuration: "Планируемое время",
+          plannedDurationDays: "{{n}} календ. дн.",
+          plannedDurationInvalid: "Финиш раньше старта",
+          plannedDurationNeedDates: "Укажите даты старта и финиша",
           attachments: "Вложения",
           upload: "Загрузить файл",
           link: "Ссылка",
@@ -281,7 +297,7 @@ export function CardModal({
           typeCard: "Карточка",
           typeBug: "Баг",
           typeFeature: "Фича",
-          addParticipant: "Добавить участника",
+          addParticipant: "Добавить ответственного",
           blockCard: "Заблокировать карточку",
           blockReasonLabel: "Причина блокировки",
           blockReasonRequired: "Укажите причину — без неё блокировку поставить нельзя.",
@@ -291,24 +307,16 @@ export function CardModal({
           attachmentsLinks: "Вложения и ссылки",
           addMenuDue: "Срок (дата окончания)",
           addMenuTags: "Теги (быстро)",
-          addMenuChecklist: "Чек-лист",
           addMenuLink: "Ссылка (URL)",
           addMenuFile: "Загрузить файл",
           addMenuParent: "ID родительской карточки",
           addMenuChild: "Создать дочернюю карточку",
-          addMenuAcceptance: "Чек-лист критериев приёмки",
           addMenuGdrive: "Ссылка Google Drive",
           addMenuDropbox: "Ссылка Dropbox",
           addMenuNewField: "Произвольное поле",
           addMenuTimeSpent: "Трудозатраты (мин.)",
           addMenuSize: "Размер",
           addMenuTimeline: "Заметка timeline",
-          checklistModalTitle: "Новый чек-лист",
-          checklistNameLabel: "Название",
-          checklistModeCheckbox: "Чекбоксы",
-          checklistModePoll: "Опрос (варианты)",
-          checklistOptionsPlaceholder: "Варианты, по одному в строке (для опроса)",
-          createChecklist: "Создать",
           descEditTab: "Редактирование",
           descPreviewTab: "Просмотр",
           descMarkdownHint:
@@ -319,16 +327,13 @@ export function CardModal({
   const [commentBusy, setCommentBusy] = useState(false);
   const [uploadBusy, setUploadBusy] = useState(false);
   const [linkBusy, setLinkBusy] = useState(false);
-  const [checklistBusy, setChecklistBusy] = useState(false);
+  const [attachmentDeleteId, setAttachmentDeleteId] = useState<string | null>(null);
   const [showLinkForm, setShowLinkForm] = useState(false);
   const [linkUrl, setLinkUrl] = useState("");
   const [linkName, setLinkName] = useState("");
-  const [checklistTitle, setChecklistTitle] = useState("");
-  const [newChecklistItem, setNewChecklistItem] = useState<Record<string, string>>({});
   const [menuOpen, setMenuOpen] = useState(false);
   const [cardBusy, setCardBusy] = useState(false);
   const [planBusy, setPlanBusy] = useState(false);
-  const [fieldBusy, setFieldBusy] = useState(false);
   const [localNotice, setLocalNotice] = useState<string | null>(null);
   const [titleDraft, setTitleDraft] = useState(card.title || "");
   const [descriptionDraft, setDescriptionDraft] = useState(card.description || "");
@@ -336,16 +341,11 @@ export function CardModal({
   const [estimateDraft, setEstimateDraft] = useState(card.estimate_points !== null ? String(card.estimate_points) : "");
   const [startDraft, setStartDraft] = useState(card.planned_start_at ? card.planned_start_at.slice(0, 10) : "");
   const [endDraft, setEndDraft] = useState(card.planned_end_at ? card.planned_end_at.slice(0, 10) : "");
-  const [newFieldKey, setNewFieldKey] = useState("");
-  const [newFieldName, setNewFieldName] = useState("");
-  const [newFieldValue, setNewFieldValue] = useState("");
   const [priorityDraft, setPriorityDraft] = useState<"Терпит" | "Средний" | "Срочно" | "">("");
   const [tagsDraftList, setTagsDraftList] = useState<string[]>([]);
   const [tagInput, setTagInput] = useState("");
-  const [checklistModeDraft, setChecklistModeDraft] = useState<"checkbox" | "poll">("checkbox");
-  const [checklistOptionsRaw, setChecklistOptionsRaw] = useState("");
   const [addActionsDialogOpen, setAddActionsDialogOpen] = useState(false);
-  const [checklistModalOpen, setChecklistModalOpen] = useState(false);
+  const [shareCopied, setShareCopied] = useState(false);
   const [blockDialogOpen, setBlockDialogOpen] = useState(false);
   const [blockReasonDraft, setBlockReasonDraft] = useState("");
   const [blockBusy, setBlockBusy] = useState(false);
@@ -381,30 +381,6 @@ export function CardModal({
 
   const normalizedType = normalizeTaskCardType(card.card_type);
 
-  const hiddenFieldKeys = useMemo(
-    () =>
-      new Set([
-        PARTICIPANT_FIELD_KEY,
-        "assignee_user_id",
-        "assignee_name",
-        "priority",
-        "tags",
-        "blocked_count",
-        "blocking_count",
-        "block_reason",
-        "card_type",
-      ]),
-    []
-  );
-
-  const visibleCustomFields = useMemo(
-    () =>
-      card.field_values.filter(
-        (fv) => !hiddenFieldKeys.has(fv.key) && !fv.key.startsWith("checklist_mode:")
-      ),
-    [card.field_values, hiddenFieldKeys]
-  );
-
   const priorityField = useMemo(() => card.field_values.find((f) => f.key === "priority"), [card.field_values]);
   const tagsField = useMemo(() => card.field_values.find((f) => f.key === "tags"), [card.field_values]);
 
@@ -431,16 +407,31 @@ export function CardModal({
     }
   }, [card, priorityField?.value, tagsField?.value]);
 
-  const checklistModeMap = useMemo(() => {
-    const map: Record<string, "checkbox" | "poll"> = {};
-    for (const fv of card.field_values) {
-      if (!fv.key.startsWith("checklist_mode:")) continue;
-      const id = fv.key.slice("checklist_mode:".length);
-      const val = typeof fv.value === "string" ? fv.value : "";
-      map[id] = val === "poll" ? "poll" : "checkbox";
+  const shareUrl = useMemo(() => {
+    if (typeof window === "undefined") return "";
+    const base = shareAppPath.startsWith("/") ? shareAppPath : `/${shareAppPath}`;
+    const q = new URLSearchParams({ card: card.id });
+    if (card.board_id) q.set("board", card.board_id);
+    return `${window.location.origin}${base}?${q.toString()}`;
+  }, [card.id, card.board_id, shareAppPath]);
+
+  const plannedDurationLabel = useMemo(() => {
+    if (!startDraft || !endDraft) {
+      return locale === "en" ? "Set start and end dates" : "Укажите даты старта и финиша";
     }
-    return map;
-  }, [card.field_values]);
+    const start = new Date(`${startDraft}T00:00:00`).getTime();
+    const end = new Date(`${endDraft}T00:00:00`).getTime();
+    if (Number.isNaN(start) || Number.isNaN(end)) {
+      return locale === "en" ? "Set start and end dates" : "Укажите даты старта и финиша";
+    }
+    if (end < start) {
+      return locale === "en" ? "End date is before start" : "Финиш раньше старта";
+    }
+    const inclusiveDays = Math.floor((end - start) / 86400000) + 1;
+    return locale === "en"
+      ? `${inclusiveDays} calendar day(s)`
+      : `${inclusiveDays} календ. дн.`;
+  }, [startDraft, endDraft, locale]);
 
   async function handleFile(file: File) {
     if (!onUploadAttachment) return;
@@ -524,7 +515,7 @@ export function CardModal({
         const unique = [...new Set(ids.filter(Boolean))];
         await onUpsertFieldValue({
           key: PARTICIPANT_FIELD_KEY,
-          name: locale === "en" ? "Participants" : "Участники",
+          name: locale === "en" ? "Responsibles" : "Ответственные",
           value: unique,
           field_type: "text",
         });
@@ -544,7 +535,7 @@ export function CardModal({
         });
       } catch (e: any) {
         setLocalNotice(
-          e?.message ?? (locale === "en" ? "Failed to update participants" : "Не удалось обновить участников")
+          e?.message ?? (locale === "en" ? "Failed to update responsibles" : "Не удалось обновить ответственных")
         );
       } finally {
         setParticipantBusy(false);
@@ -605,49 +596,6 @@ export function CardModal({
     },
     [onUpdateCard]
   );
-
-  const createChecklistFromModal = useCallback(async () => {
-    if (!onAddChecklist || !checklistTitle.trim()) return;
-    setChecklistBusy(true);
-    setLocalNotice(null);
-    try {
-      const created = await onAddChecklist(checklistTitle.trim());
-      const createdId = created && typeof created === "object" && "id" in created ? created.id : null;
-      if (createdId && onUpsertFieldValue) {
-        await onUpsertFieldValue({
-          key: `checklist_mode:${createdId}`,
-          name: locale === "en" ? "Checklist mode" : "Тип чек-листа",
-          value: checklistModeDraft,
-          field_type: "text",
-        });
-      }
-      const options = checklistOptionsRaw
-        .split("\n")
-        .map((x) => x.trim())
-        .filter(Boolean);
-      if (createdId && onAddChecklistItem && options.length) {
-        for (const opt of options) {
-          await onAddChecklistItem(createdId, opt);
-        }
-      }
-      setChecklistModalOpen(false);
-      setChecklistTitle("");
-      setChecklistOptionsRaw("");
-      setLocalNotice(locale === "en" ? "Checklist created." : "Чек-лист создан.");
-    } catch (e: any) {
-      setLocalNotice(e?.message ?? (locale === "en" ? "Could not create checklist" : "Не удалось создать чек-лист"));
-    } finally {
-      setChecklistBusy(false);
-    }
-  }, [
-    onAddChecklist,
-    checklistTitle,
-    onUpsertFieldValue,
-    checklistModeDraft,
-    checklistOptionsRaw,
-    onAddChecklistItem,
-    locale,
-  ]);
 
   const submitBlockCard = useCallback(async () => {
     const reason = blockReasonDraft.trim();
@@ -718,12 +666,12 @@ export function CardModal({
         setBlockReasonDraft("");
         setBlockDialogOpen(true);
       } else if (action === "share") {
-        await onUpsertFieldValue?.({
-          key: "blocking_count",
-          name: locale === "en" ? "Blocking cards count" : "Количество блокируемых карточек",
-          value: 1,
-          field_type: "number",
-        });
+        try {
+          await navigator.clipboard.writeText(shareUrl);
+          setLocalNotice(locale === "en" ? "Link copied to clipboard" : "Ссылка скопирована в буфер");
+        } catch {
+          setLocalNotice(locale === "en" ? "Could not copy link" : "Не удалось скопировать ссылку");
+        }
       } else if (action === "link-service") {
         const serviceUrl = window.prompt("URL", "https://");
         if (serviceUrl && onAddAttachmentUrl) {
@@ -733,13 +681,63 @@ export function CardModal({
           });
         }
       } else if (action === "print") {
-        window.print();
+        const printTitle = card.title || (locale === "en" ? "Task" : "Задача");
+        const created = card.created_at
+          ? new Date(card.created_at).toLocaleString(locale === "en" ? "en-US" : "ru-RU")
+          : t.justNow;
+        const due = card.due_at
+          ? new Date(card.due_at).toLocaleDateString(locale === "en" ? "en-US" : "ru-RU")
+          : "—";
+        const responsibles = participantIdsForUi
+          .map((uid) => {
+            const u = users.find((x) => x.id === uid);
+            return u?.full_name || u?.email || uid.slice(0, 8);
+          })
+          .filter(Boolean)
+          .join(", ") || "—";
+        const comments = card.comments
+          .map(
+            (c) =>
+              `<li><strong>${c.author_full_name || c.author_email}</strong> — ${
+                c.created_at ? new Date(c.created_at).toLocaleString(locale === "en" ? "en-US" : "ru-RU") : ""
+              }<br/>${(c.body || "").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</li>`
+          )
+          .join("");
+        const win = window.open("", "_blank", "noopener,noreferrer,width=1100,height=900");
+        if (!win) return;
+        win.document.write(`
+          <!doctype html><html><head><meta charset="utf-8"/><title>${printTitle}</title>
+          <style>
+            body{font-family:Inter,-apple-system,Segoe UI,Roboto,sans-serif;margin:24px;color:#111}
+            h1{margin:0 0 8px;font-size:28px}.meta{color:#555;font-size:12px;margin-bottom:16px}
+            .card{border:1px solid #d6d8dc;border-radius:14px;padding:16px;margin-bottom:16px}
+            .row{display:grid;grid-template-columns:160px 1fr;gap:8px;font-size:13px;margin:4px 0}
+            .k{color:#666;font-weight:600}.v{color:#111}
+            .desc{white-space:pre-wrap;line-height:1.5;font-size:13px;margin-top:8px}
+            h2{font-size:16px;margin:20px 0 8px} ul{padding-left:18px;margin:0} li{margin:8px 0;line-height:1.45}
+            @media print{body{margin:10mm}}
+          </style></head><body>
+            <h1>${printTitle}</h1>
+            <div class="meta">#${card.id.slice(0, 8)} · ${t.created}: ${created}</div>
+            <div class="card">
+              <div class="row"><div class="k">${t.column}</div><div class="v">${card.column_name || "—"}</div></div>
+              <div class="row"><div class="k">${locale === "en" ? "Due date" : "Срок"}</div><div class="v">${due}</div></div>
+              <div class="row"><div class="k">${t.participants}</div><div class="v">${responsibles}</div></div>
+              <div class="row"><div class="k">${t.type}</div><div class="v">${normalizedType}</div></div>
+              <div class="desc">${(card.description || "—").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</div>
+            </div>
+            <h2>${t.comments}</h2>
+            <ul>${comments || `<li>${t.noComments}</li>`}</ul>
+          </body></html>
+        `);
+        win.document.close();
+        win.focus();
       } else if (action === "email-comments") {
         const body = card.comments.map((c) => `- ${c.author_full_name || c.author_email}: ${c.body}`).join("\n");
         window.location.href = `mailto:?subject=${encodeURIComponent(card.title)}&body=${encodeURIComponent(body || card.title)}`;
       } else if (action === "archive") {
-        const doneCol = availableColumns.find((c) => c.is_done);
-        if (doneCol && onUpdateCard) await onUpdateCard({ column_id: doneCol.id });
+        if (!onArchiveCard) return;
+        await onArchiveCard();
       } else if (action === "delete") {
         if (!onDeleteCard) return;
         const confirmed = window.confirm(locale === "en" ? "Delete card?" : "Удалить карточку?");
@@ -784,10 +782,6 @@ export function CardModal({
             });
           }
         }
-      } else if (action === "checklist") {
-        setAddActionsDialogOpen(false);
-        setChecklistModalOpen(true);
-        return;
       } else if (action === "link") {
         setShowLinkForm(true);
       } else if (action === "file") {
@@ -806,9 +800,6 @@ export function CardModal({
         });
         onCreateRelatedCard?.();
         setLocalNotice(locale === "en" ? "Child card creation opened" : "Открыто создание дочерней карточки");
-      } else if (action === "acceptance") {
-        if (!onAddChecklist) return;
-        await onAddChecklist(locale === "en" ? "Acceptance criteria" : "Критерии приёмки");
       } else if (action === "gdrive") {
         const value = window.prompt("Google Drive URL", "https://drive.google.com/");
         if (value && onAddAttachmentUrl) await onAddAttachmentUrl({ file_url: value, file_name: "Google Drive" });
@@ -871,7 +862,6 @@ export function CardModal({
       onClick={() => {
         setMenuOpen(false);
         setAddActionsDialogOpen(false);
-        setChecklistModalOpen(false);
       }}
     >
       <div
@@ -907,7 +897,54 @@ export function CardModal({
                 {card.created_at ? new Date(card.created_at).toLocaleString(locale === "en" ? "en-US" : "ru-RU") : t.justNow}
               </div>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-col items-end gap-2 sm:flex-row sm:items-center">
+              <div className="hidden sm:flex flex-col items-end max-w-[min(100%,320px)]">
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-[var(--k-text-muted)]">{t.shareTask}</div>
+                <div className="text-[10px] text-[var(--k-text-muted)] mb-1 text-right">{t.shareHint}</div>
+                <div className="flex items-center gap-1 w-full max-w-[320px]">
+                  <input
+                    readOnly
+                    value={shareUrl}
+                    className="flex-1 min-w-0 rounded-lg border border-[var(--k-border)] bg-[var(--k-page-bg)] px-2 py-1.5 text-[11px] text-[var(--k-text)]"
+                    aria-label={t.shareTask}
+                  />
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(shareUrl);
+                        setShareCopied(true);
+                        setTimeout(() => setShareCopied(false), 2000);
+                      } catch {
+                        setLocalNotice(locale === "en" ? "Could not copy" : "Не удалось скопировать");
+                      }
+                    }}
+                    className="shrink-0 rounded-lg border border-[var(--k-border)] px-2 py-1.5 text-xs font-semibold text-[var(--k-text)] hover:bg-[var(--k-page-bg)] flex items-center gap-1"
+                  >
+                    <IosShareOutlinedIcon sx={{ fontSize: 16 }} />
+                    {shareCopied ? t.copied : t.copyLink}
+                  </button>
+                </div>
+              </div>
+              <div className="flex sm:hidden flex-col w-full max-w-[280px]">
+                <div className="text-[10px] font-semibold uppercase text-[var(--k-text-muted)] mb-1">{t.shareTask}</div>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(shareUrl);
+                      setShareCopied(true);
+                      setTimeout(() => setShareCopied(false), 2000);
+                    } catch {
+                      setLocalNotice(locale === "en" ? "Could not copy" : "Не удалось скопировать");
+                    }
+                  }}
+                  className="w-full rounded-xl border border-[var(--k-border)] py-2 text-sm font-semibold text-[var(--k-text)] flex items-center justify-center gap-2"
+                >
+                  <IosShareOutlinedIcon sx={{ fontSize: 18 }} />
+                  {shareCopied ? t.copied : t.copyLink}
+                </button>
+              </div>
               {onToggleFavorite ? (
                 <button
                   type="button"
@@ -919,7 +956,7 @@ export function CardModal({
                   {isFavorite ? <StarIcon className="text-[#FBC02D]" /> : <StarBorderIcon className="text-[var(--k-text-muted)]" />}
                 </button>
               ) : null}
-              {onAddChecklist || onUploadAttachment || onAddAttachmentUrl || onUpsertFieldValue ? (
+              {onUploadAttachment || onAddAttachmentUrl || onUpsertFieldValue ? (
                 <button
                   type="button"
                   data-testid="add-button"
@@ -972,7 +1009,14 @@ export function CardModal({
               <div className="my-1 h-px bg-[var(--k-border)]" />
               <button type="button" onClick={() => handleMenuAction("print")} className="w-full text-left rounded-lg px-3 py-2 hover:bg-[var(--k-surface-bg)]">Экспорт в PDF / Печать</button>
               <button type="button" onClick={() => handleMenuAction("email-comments")} className="w-full text-left rounded-lg px-3 py-2 hover:bg-[var(--k-surface-bg)]">Email комментарии</button>
-              <button type="button" onClick={() => handleMenuAction("archive")} className="w-full text-left rounded-lg px-3 py-2 hover:bg-[var(--k-surface-bg)]">Переместить в архив</button>
+              <button
+                type="button"
+                onClick={() => handleMenuAction("archive")}
+                disabled={!onArchiveCard}
+                className="w-full text-left rounded-lg px-3 py-2 hover:bg-[var(--k-surface-bg)] disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Переместить в архив
+              </button>
               <button type="button" onClick={() => handleMenuAction("delete")} className="w-full text-left rounded-lg px-3 py-2 text-red-500 hover:bg-[var(--k-surface-bg)]">{t.delete}</button>
             </div>
           </div>
@@ -1015,6 +1059,23 @@ export function CardModal({
                   )}
               </select>
             </div>
+            {canManagerOrAdmin && card.column_dwell_times && card.column_dwell_times.length > 0 ? (
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-wider text-[var(--k-text-muted)] mb-1">
+                  {locale === "en" ? "Time per stage" : "Время по стадиям"}
+                </div>
+                <ul className="space-y-1 text-sm">
+                  {card.column_dwell_times.map((row) => (
+                    <li key={row.column_id} className="flex justify-between gap-3 text-[var(--k-text)]">
+                      <span className="truncate min-w-0">{row.column_name || "—"}</span>
+                      <span className="text-[var(--k-text-muted)] shrink-0 tabular-nums">
+                        {formatDurationSeconds(row.seconds, locale)}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
               <div>
                 <div className="text-xs font-semibold uppercase tracking-wider text-[var(--k-text-muted)] mb-1">{t.type}</div>
@@ -1139,7 +1200,6 @@ export function CardModal({
             </div>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div className="rounded-2xl border border-[var(--k-border)] bg-[var(--k-page-bg)] p-4 space-y-2">
             <div className="text-xs font-semibold uppercase tracking-wider text-[var(--k-text-muted)]">{t.plan}</div>
             <div className="mt-2 text-[var(--k-text)] text-sm space-y-2">
@@ -1169,6 +1229,10 @@ export function CardModal({
                   onChange={(e) => setEndDraft(e.target.value)}
                   className="rounded-xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] px-3 py-2 text-sm text-[var(--k-text)]"
                 />
+              </div>
+              <div className="grid grid-cols-[120px_1fr] items-start gap-2 pt-1 border-t border-[var(--k-border)] mt-1">
+                <div className="text-[var(--k-text-muted)]">{t.plannedDuration}</div>
+                <div className="text-sm font-semibold text-[var(--k-text)]">{plannedDurationLabel}</div>
               </div>
               <div className="grid grid-cols-[120px_1fr] items-center gap-2">
                 <div className="text-[var(--k-text-muted)]">{locale === "en" ? "Priority" : "Приоритет"}</div>
@@ -1234,169 +1298,7 @@ export function CardModal({
             </div>
           </div>
 
-          <div className="rounded-2xl border border-[var(--k-border)] bg-[var(--k-page-bg)] p-4 space-y-2">
-            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-              <div className="text-xs font-semibold uppercase tracking-wider text-[var(--k-text-muted)]">{t.checklists}</div>
-              {onAddChecklist ? (
-                <button
-                  type="button"
-                  onClick={() => setChecklistModalOpen(true)}
-                  className="shrink-0 px-4 py-2 rounded-full text-sm font-semibold bg-gradient-to-r from-[#8A2BE2] to-[#4B0082] text-white hover:opacity-90 transition-opacity"
-                >
-                  {locale === "en" ? "Add checklist" : "Добавить чек-лист"}
-                </button>
-              ) : null}
-            </div>
-            <div className="mt-2 space-y-3">
-              {card.checklists.length ? (
-                card.checklists.map((cl) => (
-                  <div key={cl.id}>
-                    <div className="text-[var(--k-text)] text-sm font-semibold">{cl.title}</div>
-                    <div className="mt-2 space-y-2">
-                      {cl.items.map((it) => (
-                        <div key={it.id} className="text-[var(--k-text-muted)] text-sm flex items-center gap-2">
-                          {checklistModeMap[cl.id] === "poll" ? (
-                            <input
-                              type="radio"
-                              name={`poll-${cl.id}`}
-                              checked={it.is_done}
-                              onChange={async () => {
-                                if (!onToggleChecklistItem) return;
-                                for (const item of cl.items) {
-                                  await onToggleChecklistItem(item.id, item.id === it.id);
-                                }
-                              }}
-                            />
-                          ) : (
-                            <input
-                              type="checkbox"
-                              checked={it.is_done}
-                              onChange={async (e) => {
-                                if (!onToggleChecklistItem) return;
-                                await onToggleChecklistItem(it.id, e.target.checked);
-                              }}
-                            />
-                          )}
-                          <span className={it.is_done ? "line-through" : ""}>{it.title}</span>
-                        </div>
-                      ))}
-                    </div>
-                    {onAddChecklistItem ? (
-                      <div className="mt-2 flex gap-2">
-                        <input
-                          value={newChecklistItem[cl.id] || ""}
-                          onChange={(e) => setNewChecklistItem((prev) => ({ ...prev, [cl.id]: e.target.value }))}
-                          placeholder={t.addItem}
-                          className="flex-1 rounded-xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] px-3 py-2 text-[var(--k-text)] outline-none text-sm"
-                        />
-                        <button
-                          type="button"
-                          onClick={async () => {
-                            const title = (newChecklistItem[cl.id] || "").trim();
-                            if (!title) return;
-                            await onAddChecklistItem(cl.id, title);
-                            setNewChecklistItem((prev) => ({ ...prev, [cl.id]: "" }));
-                          }}
-                          className="rounded-xl px-3 py-2 border border-[var(--k-border)] text-xs hover:bg-[var(--k-surface-bg)]"
-                        >
-                          {t.add}
-                        </button>
-                      </div>
-                    ) : null}
-                  </div>
-                ))
-              ) : (
-                <div className="text-[var(--k-text-muted)] text-sm">{t.noChecklists}</div>
-              )}
-            </div>
-          </div>
-          </div>
-
           <div className="rounded-2xl border border-[var(--k-border)] bg-[var(--k-page-bg)] p-4 space-y-3">
-        <div className="text-xs font-semibold uppercase tracking-wider text-[var(--k-text-muted)]">{t.fields}</div>
-        <div className="space-y-2">
-          {visibleCustomFields.length ? (
-            visibleCustomFields.map((fv) => (
-              <div key={fv.id} className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-                <div className="text-[var(--k-text)] text-sm font-medium shrink-0">{fv.name}</div>
-                <input
-                  defaultValue={
-                    typeof fv.value === "string" ? fv.value : fv.value === null ? "" : JSON.stringify(fv.value)
-                  }
-                  onBlur={async (e) => {
-                    if (!onUpsertFieldValue) return;
-                    try {
-                      await onUpsertFieldValue({
-                        key: fv.key,
-                        name: fv.name,
-                        value: e.target.value,
-                        field_type: "text",
-                      });
-                    } catch (err: any) {
-                      setLocalNotice(err?.message ?? "Не удалось обновить поле");
-                    }
-                  }}
-                  className="text-[var(--k-text)] text-sm w-full sm:w-[58%] bg-[var(--k-surface-bg)] border border-[var(--k-border)] rounded-xl px-3 py-2"
-                />
-              </div>
-            ))
-          ) : (
-            <div className="text-[var(--k-text-muted)] text-sm">{t.noFields}</div>
-          )}
-        </div>
-        {onUpsertFieldValue ? (
-          <div className="rounded-xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] p-3 grid grid-cols-1 md:grid-cols-3 gap-2">
-            <input
-              value={newFieldKey}
-              onChange={(e) => setNewFieldKey(e.target.value)}
-              placeholder={locale === "en" ? "Field key" : "Ключ поля"}
-              className="rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] px-3 py-2 text-sm text-[var(--k-text)]"
-            />
-            <input
-              value={newFieldName}
-              onChange={(e) => setNewFieldName(e.target.value)}
-              placeholder={locale === "en" ? "Field name" : "Название поля"}
-              className="rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] px-3 py-2 text-sm text-[var(--k-text)]"
-            />
-            <input
-              value={newFieldValue}
-              onChange={(e) => setNewFieldValue(e.target.value)}
-              placeholder={locale === "en" ? "Value" : "Значение"}
-              className="rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] px-3 py-2 text-sm text-[var(--k-text)]"
-            />
-            <div className="md:col-span-3 flex justify-end">
-              <button
-                type="button"
-                disabled={!newFieldKey.trim() || fieldBusy}
-                onClick={async () => {
-                  if (!onUpsertFieldValue || !newFieldKey.trim()) return;
-                  setFieldBusy(true);
-                  try {
-                    await onUpsertFieldValue({
-                      key: newFieldKey.trim(),
-                      name: newFieldName.trim() || newFieldKey.trim(),
-                      value: newFieldValue,
-                      field_type: "text",
-                    });
-                    setNewFieldKey("");
-                    setNewFieldName("");
-                    setNewFieldValue("");
-                  } catch (e: any) {
-                    setLocalNotice(e?.message ?? "Не удалось добавить поле");
-                  } finally {
-                    setFieldBusy(false);
-                  }
-                }}
-                className="px-4 py-2 rounded-full border border-[var(--k-border)] hover:bg-[var(--k-page-bg)] disabled:opacity-60 text-sm font-semibold"
-              >
-                {fieldBusy ? t.adding : t.add}
-              </button>
-            </div>
-          </div>
-        ) : null}
-      </div>
-
-      <div className="rounded-2xl border border-[var(--k-border)] bg-[var(--k-page-bg)] p-4 space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="text-xs font-semibold uppercase tracking-wider text-[var(--k-text-muted)]">{t.attachmentsLinks}</div>
           <div className="text-[var(--k-text-muted)] text-xs">
@@ -1476,20 +1378,50 @@ export function CardModal({
                   <div className="text-[var(--k-text)] text-sm truncate font-semibold">{a.file_name}</div>
                   {a.size_bytes !== null && a.size_bytes !== undefined ? <div className="text-[var(--k-text-muted)] text-xs mt-0.5">{a.size_bytes} байт</div> : null}
                 </div>
-                {a.file_url ? (
-                  <a href={a.file_url} target="_blank" rel="noreferrer" className="text-[var(--k-text)] text-sm hover:underline font-semibold shrink-0">
-                    {t.open}
-                  </a>
-                ) : (
-                  <div className="text-[var(--k-text-muted)] text-sm shrink-0">—</div>
-                )}
+                <div className="flex items-center gap-2 shrink-0">
+                  {a.file_url ? (
+                    <a href={a.file_url} target="_blank" rel="noreferrer" className="text-[var(--k-text)] text-sm hover:underline font-semibold">
+                      {t.open}
+                    </a>
+                  ) : (
+                    <div className="text-[var(--k-text-muted)] text-sm">—</div>
+                  )}
+                  {canManagerOrAdmin && onDeleteAttachment ? (
+                    <button
+                      type="button"
+                      disabled={attachmentDeleteId === a.id}
+                      onClick={() => {
+                        void (async () => {
+                          setLocalNotice(null);
+                          setAttachmentDeleteId(a.id);
+                          try {
+                            await onDeleteAttachment(a.id);
+                          } catch (err: unknown) {
+                            const msg =
+                              err instanceof Error && err.message
+                                ? err.message
+                                : locale === "en"
+                                  ? "Could not delete attachment"
+                                  : "Не удалось удалить вложение";
+                            setLocalNotice(msg);
+                          } finally {
+                            setAttachmentDeleteId(null);
+                          }
+                        })();
+                      }}
+                      className="text-sm font-semibold text-[#C62828] hover:underline disabled:opacity-50"
+                    >
+                      {attachmentDeleteId === a.id ? (locale === "en" ? "…" : "…") : t.delete}
+                    </button>
+                  ) : null}
+                </div>
               </div>
             ))
           ) : (
             <div className="text-[var(--k-text-muted)] text-sm">{t.noAttachments}</div>
           )}
         </div>
-      </div>
+          </div>
 
             </div>
 
@@ -1572,11 +1504,6 @@ export function CardModal({
                   {t.addMenuTags}
                 </button>
               ) : null}
-              {onAddChecklist ? (
-                <button type="button" className={addMenuRowClass} onClick={() => void handleAddMenuAction("checklist")}>
-                  {t.addMenuChecklist}
-                </button>
-              ) : null}
               {onAddAttachmentUrl ? (
                 <button type="button" className={addMenuRowClass} onClick={() => void handleAddMenuAction("link")}>
                   {t.addMenuLink}
@@ -1595,11 +1522,6 @@ export function CardModal({
               {onUpsertFieldValue ? (
                 <button type="button" className={addMenuRowClass} onClick={() => void handleAddMenuAction("child")}>
                   {t.addMenuChild}
-                </button>
-              ) : null}
-              {onAddChecklist ? (
-                <button type="button" className={addMenuRowClass} onClick={() => void handleAddMenuAction("acceptance")}>
-                  {t.addMenuAcceptance}
                 </button>
               ) : null}
               {onAddAttachmentUrl ? (
@@ -1637,85 +1559,6 @@ export function CardModal({
           <DialogActions sx={{ px: 3, pb: 2 }}>
             <Button onClick={() => setAddActionsDialogOpen(false)} sx={{ color: "var(--k-text-muted)" }}>
               {t.cancel}
-            </Button>
-          </DialogActions>
-        </Dialog>
-
-        <Dialog
-          open={checklistModalOpen}
-          onClose={() => {
-            if (!checklistBusy) setChecklistModalOpen(false);
-          }}
-          fullWidth
-          maxWidth="sm"
-          slotProps={{ paper: { sx: dialogPaperSx } }}
-        >
-          <DialogTitle sx={{ fontSize: 18, fontWeight: 700 }}>{t.checklistModalTitle}</DialogTitle>
-          <DialogContent>
-            <Typography variant="body2" sx={{ color: "var(--k-text-muted)", mb: 1.5 }}>
-              {locale === "en" ? "Add a title and optional poll options." : "Укажите название и при необходимости варианты опроса."}
-            </Typography>
-            <div className="space-y-3">
-              <TextField
-                autoFocus
-                fullWidth
-                value={checklistTitle}
-                onChange={(e) => setChecklistTitle(e.target.value)}
-                disabled={checklistBusy}
-                label={t.checklistNameLabel}
-                slotProps={{ input: { sx: { color: "var(--k-text)" } } }}
-                sx={{
-                  "& .MuiOutlinedInput-notchedOutline": { borderColor: "var(--k-border)" },
-                  "& label": { color: "var(--k-text-muted)" },
-                }}
-              />
-              <div>
-                <Typography variant="caption" sx={{ color: "var(--k-text-muted)", display: "block", mb: 0.75 }}>
-                  {locale === "en" ? "Mode" : "Режим"}
-                </Typography>
-                <select
-                  value={checklistModeDraft}
-                  onChange={(e) => setChecklistModeDraft((e.target.value as "checkbox" | "poll") || "checkbox")}
-                  disabled={checklistBusy}
-                  className="w-full rounded-xl border border-[var(--k-border)] bg-[var(--k-page-bg)] px-3 py-2.5 text-sm text-[var(--k-text)]"
-                >
-                  <option value="checkbox">{t.checklistModeCheckbox}</option>
-                  <option value="poll">{t.checklistModePoll}</option>
-                </select>
-              </div>
-              <TextField
-                fullWidth
-                multiline
-                minRows={3}
-                value={checklistOptionsRaw}
-                onChange={(e) => setChecklistOptionsRaw(e.target.value)}
-                disabled={checklistBusy}
-                label={t.checklistOptionsPlaceholder}
-                slotProps={{ input: { sx: { color: "var(--k-text)" } } }}
-                sx={{
-                  "& .MuiOutlinedInput-notchedOutline": { borderColor: "var(--k-border)" },
-                  "& label": { color: "var(--k-text-muted)" },
-                }}
-              />
-            </div>
-          </DialogContent>
-          <DialogActions sx={{ px: 3, pb: 2 }}>
-            <Button
-              onClick={() => {
-                if (!checklistBusy) setChecklistModalOpen(false);
-              }}
-              disabled={checklistBusy}
-              sx={{ color: "var(--k-text-muted)" }}
-            >
-              {t.cancel}
-            </Button>
-            <Button
-              variant="contained"
-              disabled={checklistBusy || !checklistTitle.trim() || !onAddChecklist}
-              onClick={() => void createChecklistFromModal()}
-              sx={{ bgcolor: "#9C27B0", "&:hover": { bgcolor: "#7B1FA2" } }}
-            >
-              {checklistBusy ? t.adding : t.createChecklist}
             </Button>
           </DialogActions>
         </Dialog>

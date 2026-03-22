@@ -2395,6 +2395,25 @@ export function KanbanBoard({
             await loadCardDetails(selectedCardId);
             await fetchGrid(boardId);
           }}
+          onArchiveCard={
+            grid?.effective_role === "manager" || grid?.effective_role === "admin"
+              ? async () => {
+                  if (!selectedCardId) return;
+                  const res = await fetch(getApiUrl(`/api/kanban/cards/${selectedCardId}/archive`), {
+                    method: "POST",
+                    headers: {
+                      Authorization: `Bearer ${token}`,
+                      ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
+                    },
+                  });
+                  const data = (await res.json().catch(() => null)) as { detail?: string } | null;
+                  if (!res.ok) throw new Error(data?.detail ?? "Не удалось отправить карточку в архив");
+                  setSelectedCard(null);
+                  setSelectedCardId(null);
+                  await fetchGrid(boardId);
+                }
+              : undefined
+          }
           onDeleteCard={async () => {
             if (!selectedCardId) return;
             const res = await fetch(getApiUrl(`/api/kanban/cards/${selectedCardId}`), {
