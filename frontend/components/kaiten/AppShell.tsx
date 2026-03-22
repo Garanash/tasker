@@ -237,9 +237,6 @@ export default function AppShell({
         ? {
             search: "Search",
             messages: "Messages",
-            lists: "Tasks",
-            reports: "Reports",
-            archive: "Archive",
             filters: "Filters",
             folder: "Folder",
             space: "Space",
@@ -258,9 +255,6 @@ export default function AppShell({
         : {
             search: "Найти",
             messages: "Сообщения",
-            lists: "Задачи",
-            reports: "Отчёты",
-            archive: "Архив",
             filters: "Фильтры",
             folder: "Папку",
             space: "Пространство",
@@ -466,7 +460,6 @@ export default function AppShell({
           aria-label={t.messages}
           data-testid="header-messages"
           onClick={() => {
-            setLeftDrawerOpen(true);
             onDirectMessagesClick?.();
           }}
           sx={{ color: "rgba(255,255,255,0.8)" }}
@@ -684,37 +677,6 @@ export default function AppShell({
             </>
           )}
         </Menu>
-
-        <Divider orientation="vertical" flexItem sx={{ mx: 1, borderColor: BORDER_GRAY }} />
-
-        {/* Кнопки навигации: Задачи, Отчёты, Архив */}
-        <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }} data-testid="header-buttons">
-          {[
-            { id: "lists", label: t.lists },
-            { id: "reports", label: t.reports },
-            { id: "archive", label: t.archive },
-          ].map((btn) => (
-            <Button
-              key={btn.id}
-              size="small"
-              onClick={() => onTabChange?.(btn.id)}
-              data-testid={`header-btn-${btn.id}`}
-              sx={{
-                textTransform: "none",
-                fontWeight: 500,
-                fontSize: 13,
-                color: activeTabId === btn.id ? TEXT_DARK : TEXT_GRAY,
-                bgcolor: activeTabId === btn.id ? "var(--k-active, #E8E8E8)" : "transparent",
-                borderRadius: 1,
-                px: 1.5,
-                minWidth: "auto",
-                "&:hover": { bgcolor: "var(--k-hover, #F5F5F5)" },
-              }}
-            >
-              {btn.label}
-            </Button>
-          ))}
-        </Box>
 
         <Box sx={{ flex: 1 }} />
 

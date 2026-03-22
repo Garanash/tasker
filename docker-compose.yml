@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:16
+    image: public.ecr.aws/docker/library/postgres:16
     environment:
       POSTGRES_DB: kaiten
       POSTGRES_USER: kaiten
@@ -13,6 +13,11 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: public.ecr.aws/docker/library/redis:7-alpine
+    ports:
+      - "6379:6379"
+
   backend:
     build:
       context: ./backend
@@ -21,6 +26,10 @@ services:
       - ./backend:/app
     environment:
       DATABASE_URL: postgresql://kaiten:kaiten@db:5432/kaiten
+      REDIS_URL: ${REDIS_URL:-}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-}
+      USE_CELERY_BEAT: ${USE_CELERY_BEAT:-0}
       SECRET_KEY: dev-secret-key-change-me
       MEDIA_ROOT: /app/media
       MEDIA_URL: /media/

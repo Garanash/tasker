@@ -75,6 +75,32 @@ type Card = {
 };
 type OrgMember = { id: string; email: string; full_name: string; role: "executor" | "manager" | "admin" };
 
+function formatKanbanGridError(raw: unknown, res: Response, locale: "ru" | "en"): string {
+  const generic =
+    locale === "en" ? "Could not load board." : "Не удалось загрузить доску.";
+  if (raw && typeof raw === "object") {
+    const d = (raw as { detail?: unknown }).detail;
+    if (typeof d === "string" && d.trim()) return d.trim();
+    if (Array.isArray(d)) {
+      const parts = d.map((item: unknown) => {
+        if (item && typeof item === "object" && "msg" in item && typeof (item as { msg: unknown }).msg === "string") {
+          return (item as { msg: string }).msg;
+        }
+        return typeof item === "string" ? item : JSON.stringify(item);
+      });
+      const joined = parts.filter(Boolean).join("; ");
+      if (joined) return joined;
+    }
+  }
+  if (!res.ok) {
+    if (res.status === 401) {
+      return locale === "en" ? "Session expired. Sign in again." : "Сессия истекла. Войдите снова.";
+    }
+    return locale === "en" ? `${generic} (HTTP ${res.status})` : `${generic} (HTTP ${res.status})`;
+  }
+  return generic;
+}
+
 type Column = {
   id: string;
   name: string;
@@ -479,16 +505,7 @@ export function KanbanBoard({
         const raw = (await res.json().catch(() => null)) as BoardGrid | { detail?: string } | null;
         if (signal?.aborted) return;
         if (!res.ok) {
-          const detail = typeof (raw as { detail?: string } | null)?.detail === "string" ? (raw as { detail: string }).detail : null;
-          const msg =
-            detail ||
-            (res.status === 401
-              ? locale === "en"
-                ? "Session expired. Sign in again."
-                : "Сессия истекла. Войдите снова."
-              : locale === "en"
-                ? "Could not load board."
-                : "Не удалось загрузить доску.");
+          const msg = formatKanbanGridError(raw, res, locale);
           setGrid(null);
           setGridLoadError(msg);
           setBoardNotice(msg);

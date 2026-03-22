@@ -1,6 +1,6 @@
 """
-Периодическая задача: deadline-автоматизации (аналог core.process_deadline_automations).
-Запускается из FastAPI по таймеру; использует asyncpg и WsBoardConnectionManager для broadcast.
+Deadline-автоматизации: APScheduler в dev или Celery Beat в проде.
+Использует asyncpg; broadcast через WsBoardConnectionManager или Redis Pub/Sub (воркер).
 """
 from __future__ import annotations
 
@@ -67,6 +67,8 @@ def _card_row_to_payload(row: asyncpg.Record) -> dict[str, Any]:
 async def run_deadline_automations(
     pool: asyncpg.Pool,
     manager: Any,
+    *,
+    redis_url: str | None = None,
 ) -> None:
     """
     Для правил trigger_type=deadline: карточки с due_at <= now перемещаем по action.
@@ -187,5 +189,10 @@ async def run_deadline_automations(
                                 "to_column_id": to_column_id,
                             },
                         }
-                        await manager.broadcast(str(board_id), payload)
+                        if manager:
+                            await manager.broadcast(str(board_id), payload)
+                        elif redis_url:
+                            from .ws_redis import publish_board_ws_sync
+
+                            publish_board_ws_sync(redis_url, str(board_id), payload)
                     break

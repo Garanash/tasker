@@ -540,6 +540,7 @@ export default function AppHomePageImplGray() {
   >([]);
   const [currentUserId, setCurrentUserId] = useState<string | null>(null);
   const [dmPeer, setDmPeer] = useState<DmPeer | null>(null);
+  const [dmOpen, setDmOpen] = useState(false);
   const [sidebarOrgMembersLoading, setSidebarOrgMembersLoading] = useState(false);
   const [orgUsersLoading, setOrgUsersLoading] = useState(false);
   const [orgUsersError, setOrgUsersError] = useState<string | null>(null);
@@ -557,6 +558,7 @@ export default function AppHomePageImplGray() {
   const [unreadNotificationsCount, setUnreadNotificationsCount] = useState(0);
   const [dmUnreadCount, setDmUnreadCount] = useState(0);
   const [tourOpen, setTourOpen] = useState(false);
+  const [tourStep, setTourStep] = useState(0);
   const [profileFullName, setProfileFullName] = useState("");
   const [profileAvatarUrl, setProfileAvatarUrl] = useState("");
   const [profileDialogOpen, setProfileDialogOpen] = useState(false);
@@ -748,6 +750,63 @@ export default function AppHomePageImplGray() {
     () => profileFullName.trim() || email.split("@")[0] || "Пользователь",
     [profileFullName, email],
   );
+  const tourSteps = useMemo(
+    () =>
+      uiLanguage === "en"
+        ? [
+            {
+              title: "Task board",
+              body: "Main work happens on the board. Drag cards between columns, open cards for details, and use multiple views.",
+              actionLabel: "Open tasks",
+              onAction: () => setKaitenTab("lists"),
+            },
+            {
+              title: "Views and filters",
+              body: "Switch between board/list/table/timeline/calendar in the top panel. Use Filters to find cards by assignee, priority, and due date.",
+              actionLabel: "Open tasks",
+              onAction: () => setKaitenTab("lists"),
+            },
+            {
+              title: "Team messenger",
+              body: "Use the envelope button in the header to open messenger. Contacts are on the left, active chat is on the right.",
+              actionLabel: "Open messenger",
+              onAction: () => setDmOpen(true),
+            },
+            {
+              title: "Wiki and docs",
+              body: "Open wiki from the help button for process examples and quick onboarding. Keep docs close to tasks.",
+              actionLabel: "Open wiki",
+              onAction: () => router.push("/wiki"),
+            },
+          ]
+        : [
+            {
+              title: "Работа с задачами",
+              body: "Основной сценарий — доска задач. Перетаскивайте карточки между колонками, открывайте карточку для деталей и используйте разные виды.",
+              actionLabel: "Открыть задачи",
+              onAction: () => setKaitenTab("lists"),
+            },
+            {
+              title: "Виды и фильтры",
+              body: "В верхней панели переключайте доску/список/таблицу/таймлайн/календарь. Через «Фильтры» находите карточки по ответственному, приоритету и сроку.",
+              actionLabel: "Открыть задачи",
+              onAction: () => setKaitenTab("lists"),
+            },
+            {
+              title: "Мессенджер команды",
+              body: "Кнопка с конвертом в шапке открывает мессенджер: слева контакты, справа активный чат.",
+              actionLabel: "Открыть мессенджер",
+              onAction: () => setDmOpen(true),
+            },
+            {
+              title: "Вики и документация",
+              body: "Через кнопку справки открывается вики с примерами рабочих сценариев и быстрым стартом.",
+              actionLabel: "Открыть вики",
+              onAction: () => router.push("/wiki"),
+            },
+          ],
+    [uiLanguage, router]
+  );
 
   const docEditorImmersive = kaitenTab === "settings" && docImmersiveMode && selectedDoc !== null;
   const docPreviewMode = Boolean(selectedDoc && docViewMode === "preview");
@@ -774,6 +833,7 @@ export default function AppHomePageImplGray() {
     try {
       const wasSeen = localStorage.getItem(ONBOARDING_TOUR_STORAGE_KEY);
       if (!wasSeen) {
+        setTourStep(0);
         setTourOpen(true);
       }
     } catch {
@@ -1333,6 +1393,7 @@ export default function AppHomePageImplGray() {
 
   useEffect(() => {
     setDmPeer(null);
+    setDmOpen(false);
   }, [activeOrganizationId]);
 
   async function fetchDocDetail(nextAccess: string, docId: string) {
@@ -2315,12 +2376,16 @@ export default function AppHomePageImplGray() {
       organizationMembersLoading={sidebarOrgMembersLoading}
       currentUserId={currentUserId}
       onOpenDirectMessage={(m) =>
-        setDmPeer({
-          id: m.id,
-          full_name: m.full_name,
-          email: m.email,
-          role: m.role,
-        })
+        {
+          setDmPeer({
+            id: m.id,
+            full_name: m.full_name,
+            email: m.email,
+            role: m.role,
+            avatar_url: m.avatar_url,
+          });
+          setDmOpen(true);
+        }
       }
       spaces={visibleSpaces}
       projects={visibleProjects}
@@ -2350,6 +2415,7 @@ export default function AppHomePageImplGray() {
       directMessageUnreadCount={dmUnreadCount}
       onDirectMessagesClick={() => {
         if (token?.access && activeOrganizationId) fetchDmUnread(token.access, activeOrganizationId).catch(() => {});
+        setDmOpen(true);
       }}
       notifications={notifications}
       onOpenNotifications={() => {
@@ -2450,6 +2516,7 @@ export default function AppHomePageImplGray() {
         }
         setCurrentUserId(null);
         setDmPeer(null);
+        setDmOpen(false);
       }}
     >
       <div
@@ -4171,34 +4238,86 @@ export default function AppHomePageImplGray() {
             <div className="text-[var(--k-text-muted)] text-xs uppercase tracking-wide mb-2">
               {uiLanguage === "en" ? "Platform tour" : "Тур по платформе"}
             </div>
-            <div className="text-2xl font-bold text-[var(--k-text)] mb-3">
-              {uiLanguage === "en" ? "Start faster with AGB Tasks" : "Быстрый старт в AGB Tasks"}
+            <div className="text-2xl font-bold text-[var(--k-text)] mb-1">
+              {tourSteps[tourStep]?.title}
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-              <div className="rounded-2xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] p-3">
-                <div className="font-semibold text-[var(--k-text)] mb-1">{uiLanguage === "en" ? "Boards" : "Доски"}</div>
-                <div className="text-sm text-[var(--k-text-muted)]">
-                  {uiLanguage === "en" ? "Plan work in kanban, list and calendar views." : "Планируйте задачи в канбане, списке и календаре."}
-                </div>
+            <div className="text-sm text-[var(--k-text-muted)] mb-4">
+              {tourSteps[tourStep]?.body}
+            </div>
+            <div className="mb-4 grid grid-cols-4 gap-2">
+              {tourSteps.map((_, idx) => (
+                <div
+                  key={`tour-step-${idx}`}
+                  className="h-1.5 rounded-full"
+                  style={{
+                    background: idx <= tourStep ? "linear-gradient(90deg, #8A2BE2 0%, #4B0082 100%)" : "var(--k-border)",
+                  }}
+                />
+              ))}
+            </div>
+            <div className="rounded-2xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] p-4">
+              <div className="text-xs uppercase tracking-wide text-[var(--k-text-muted)] mb-2">
+                {uiLanguage === "en"
+                  ? `Step ${tourStep + 1} of ${tourSteps.length}`
+                  : `Шаг ${tourStep + 1} из ${tourSteps.length}`}
               </div>
-              <div className="rounded-2xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] p-3">
-                <div className="font-semibold text-[var(--k-text)] mb-1">{uiLanguage === "en" ? "Documents" : "Документы"}</div>
-                <div className="text-sm text-[var(--k-text-muted)]">
-                  {uiLanguage === "en" ? "Keep process docs near tasks." : "Ведите документацию рядом с задачами."}
-                </div>
-              </div>
-              <div className="rounded-2xl border border-[var(--k-border)] bg-[var(--k-surface-bg)] p-3">
-                <div className="font-semibold text-[var(--k-text)] mb-1">{uiLanguage === "en" ? "Notifications" : "Уведомления"}</div>
-                <div className="text-sm text-[var(--k-text-muted)]">
-                  {uiLanguage === "en" ? "Track card changes and comments in real time." : "Отслеживайте изменения карточек и комментарии в реальном времени."}
-                </div>
+              <div className="text-sm text-[var(--k-text-muted)]">
+                {uiLanguage === "en"
+                  ? "Use quick action to open the section right now."
+                  : "Используйте быстрое действие, чтобы сразу открыть нужный раздел."}
               </div>
             </div>
-            <div className="mt-5 flex justify-end">
+            <div className="mt-5 flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <GreyButton
+                  variant="soft"
+                  onClick={() => {
+                    if (tourStep > 0) setTourStep((prev) => Math.max(0, prev - 1));
+                  }}
+                  disabled={tourStep === 0}
+                >
+                  {uiLanguage === "en" ? "Back" : "Назад"}
+                </GreyButton>
+                <GreyButton
+                  variant="soft"
+                  onClick={() => {
+                    tourSteps[tourStep]?.onAction();
+                  }}
+                >
+                  {tourSteps[tourStep]?.actionLabel}
+                </GreyButton>
+              </div>
+              <div className="flex items-center gap-2">
+                {tourStep < tourSteps.length - 1 ? (
+                  <GreyButton
+                    variant="primary"
+                    onClick={() => setTourStep((prev) => Math.min(tourSteps.length - 1, prev + 1))}
+                  >
+                    {uiLanguage === "en" ? "Next" : "Далее"}
+                  </GreyButton>
+                ) : null}
+                <GreyButton
+                  variant="primary"
+                  onClick={() => {
+                    setTourOpen(false);
+                    setTourStep(0);
+                    try {
+                      localStorage.setItem(ONBOARDING_TOUR_STORAGE_KEY, "1");
+                    } catch {
+                      // ignore
+                    }
+                  }}
+                >
+                  {uiLanguage === "en" ? "Finish" : "Завершить"}
+                </GreyButton>
+              </div>
+            </div>
+            <div className="mt-3 flex justify-end">
               <GreyButton
-                variant="primary"
+                variant="soft"
                 onClick={() => {
                   setTourOpen(false);
+                  setTourStep(0);
                   try {
                     localStorage.setItem(ONBOARDING_TOUR_STORAGE_KEY, "1");
                   } catch {
@@ -4206,7 +4325,7 @@ export default function AppHomePageImplGray() {
                   }
                 }}
               >
-                {uiLanguage === "en" ? "Got it" : "Понятно"}
+                {uiLanguage === "en" ? "Skip tour" : "Пропустить тур"}
               </GreyButton>
             </div>
           </div>
@@ -4448,9 +4567,16 @@ export default function AppHomePageImplGray() {
     </AppShell>
     {access && activeOrganizationId ? (
       <DirectMessageDrawer
-        open={Boolean(dmPeer)}
-        onClose={() => setDmPeer(null)}
-        peer={dmPeer}
+        open={dmOpen}
+        onClose={() => setDmOpen(false)}
+        peers={sidebarOrgMembers.map((m) => ({
+          id: m.id,
+          full_name: m.full_name,
+          email: m.email,
+          role: m.role,
+          avatar_url: m.avatar_url,
+        }))}
+        initialPeerId={dmPeer?.id ?? null}
         token={access}
         organizationId={activeOrganizationId}
         currentUserId={currentUserId}

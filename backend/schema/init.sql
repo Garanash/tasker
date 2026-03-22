@@ -88,7 +88,7 @@ CREATE TABLE IF NOT EXISTS core_card (
     track_id uuid REFERENCES core_track(id) ON DELETE SET NULL,
     title varchar(255) NOT NULL,
     description text,
-    card_type varchar(32) NOT NULL DEFAULT '\''task'\'',
+    card_type varchar(32) NOT NULL DEFAULT 'task',
     due_at timestamptz,
     planned_start_at timestamptz,
     planned_end_at timestamptz,

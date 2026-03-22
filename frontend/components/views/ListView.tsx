@@ -9,6 +9,7 @@ type Card = {
   id: string;
   title: string;
   column_id: string;
+  assignee_name?: string | null;
   due_at?: string | null;
 };
 
@@ -42,7 +43,9 @@ export default function ListView({ boards, onCardClick, locale = "ru" }: Props) 
           cards: "карточек",
           done: "Готово",
           inProgress: "В работе",
+          assignee: "Ответственный",
         };
+  const assigneeLabel = locale === "en" ? "Assignee" : "Ответственный";
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
 
   const toggle = (id: string) => {
@@ -107,7 +110,12 @@ export default function ListView({ boards, onCardClick, locale = "ru" }: Props) 
                       }}
                     />
                     <Typography sx={{ flex: 1, fontSize: 14, color: "var(--k-text)" }}>{card.title}</Typography>
-                    <Typography sx={{ color: "var(--k-text-muted)", fontSize: 12 }}>{col.name}</Typography>
+                    <Box sx={{ display: "flex", alignItems: "center", gap: 1.5 }}>
+                      <Typography sx={{ color: "var(--k-text-muted)", fontSize: 12 }}>{col.name}</Typography>
+                      <Typography sx={{ color: "var(--k-text-muted)", fontSize: 12 }}>
+                        {assigneeLabel}: {card.assignee_name || "—"}
+                      </Typography>
+                    </Box>
                   </Box>
                 ))
               )}

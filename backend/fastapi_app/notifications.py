@@ -1,5 +1,5 @@
 """
-Сервис уведомлений: хранение, выдача, отметка прочитанными.
+Сервис in-app уведомлений AGBTasker: хранение, выдача, отметка прочитанными.
 """
 from __future__ import annotations
 
@@ -111,6 +111,10 @@ async def list_notifications(
     limit: int = Query(default=20, ge=1, le=100),
     unread_only: bool = Query(default=False),
 ) -> list[dict[str, Any]]:
+    """Список уведомлений текущего пользователя.
+
+    Query: `limit` (1–100), `unread_only` — только непрочитанные. Поля: kind, title, body, metadata, is_read, created_at, read_at.
+    """
     await ensure_notifications_table()
     async with state.pg_pool.acquire() as conn:
         rows = await conn.fetch(
@@ -143,6 +147,10 @@ async def list_notifications(
 
 @router.get("/unread-count")
 async def unread_count(request: Request, user_id: str = Depends(require_authenticated_user_id)) -> dict[str, int]:
+    """Количество непрочитанных уведомлений для шапки UI.
+
+    Ответ: `{\"unread_count\": N}`.
+    """
     await ensure_notifications_table()
     async with state.pg_pool.acquire() as conn:
         count = await conn.fetchval(
@@ -158,6 +166,10 @@ async def read_notification(
     notification_id: str,
     user_id: str = Depends(require_authenticated_user_id),
 ) -> dict[str, Any]:
+    """Отметить одно уведомление прочитанным.
+
+    Чужие уведомления недоступны (404). Устанавливается read_at.
+    """
     await ensure_notifications_table()
     now = datetime.now(timezone.utc)
     async with state.pg_pool.acquire() as conn:
@@ -179,6 +191,10 @@ async def read_notification(
 
 @router.post("/read-all")
 async def read_all_notifications(request: Request, user_id: str = Depends(require_authenticated_user_id)) -> dict[str, Any]:
+    """Отметить все уведомления пользователя прочитанными.
+
+    Массовый сброс счётчика непрочитанных.
+    """
     await ensure_notifications_table()
     now = datetime.now(timezone.utc)
     async with state.pg_pool.acquire() as conn:

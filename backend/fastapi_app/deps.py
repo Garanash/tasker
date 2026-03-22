@@ -65,19 +65,39 @@ async def require_space_access(request: Request) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="space_forbidden")
 
 
+# Только три роли организации: исполнитель < менеджер < администратор
 ROLE_PRIORITY = {
-    "user": 1,
-    "executor": 2,
+    "executor": 1,
     "manager": 2,
-    "support": 2,
-    "lead": 3,
-    "admin": 4,
+    "admin": 3,
 }
+
+
+def normalize_org_role(role: str | None) -> str:
+    """Старые значения в БД (user, lead, support) приводим к актуальной модели."""
+    r = (role or "").strip().lower()
+    if r in ("user", "support"):
+        return "executor"
+    if r == "lead":
+        return "manager"
+    if r in ("executor", "manager", "admin"):
+        return r
+    return "executor"
 
 
 async def _resolve_organization_id(request: Request, user_id: str) -> str:
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
+    org_hdr = (request.headers.get("x-organization-id") or "").strip()
+    if org_hdr:
+        row = await state.pg_pool.fetchrow(
+            "SELECT 1 FROM core_organizationmember WHERE organization_id = $1::uuid AND user_id = $2::uuid",
+            org_hdr,
+            user_id,
+        )
+        if not row:
+            raise HTTPException(status_code=403, detail="organization_forbidden")
+        return org_hdr
     space_id = _get_active_space_id(dict(request.headers))
     if space_id:
         row = await state.pg_pool.fetchrow(
@@ -130,7 +150,9 @@ async def get_effective_role(user_id: str, organization_id: str) -> str:
         user_id,
         organization_id,
     )
-    roles = [str(r["role"]) for r in memberships] + [str(r["role"]) for r in group_roles]
+    roles = [normalize_org_role(str(r["role"])) for r in memberships] + [
+        normalize_org_role(str(r["role"])) for r in group_roles
+    ]
     if not roles:
         raise HTTPException(status_code=403, detail="organization_forbidden")
     best = max(roles, key=lambda role: ROLE_PRIORITY.get(role, 0))
@@ -150,11 +172,8 @@ async def require_min_role(request: Request, min_role: str) -> str:
 
 
 async def require_manager_role(request: Request) -> str:
+    """Минимум роль менеджера (исполнитель не проходит)."""
     return await require_min_role(request, "manager")
-
-
-async def require_lead_role(request: Request) -> str:
-    return await require_min_role(request, "lead")
 
 
 async def require_admin_role(request: Request) -> str:

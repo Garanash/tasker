@@ -3,8 +3,8 @@ import "./globals.css";
 import MuiThemeProvider from "../components/kaiten/MuiThemeProvider";
 
 export const metadata: Metadata = {
-  title: "AGB Tasks",
-  description: "AGB Tasks — постановка и мониторинг задач",
+  title: "AGBTasker",
+  description: "AGBTasker — постановка и мониторинг задач",
 };
 
 export default function RootLayout({

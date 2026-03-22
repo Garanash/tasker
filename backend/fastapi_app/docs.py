@@ -1,5 +1,5 @@
 """
-Documents API: список, создание, просмотр и редактирование документов.
+Documents API приложения AGBTasker: список, создание, просмотр и правка документов пространства.
 """
 from __future__ import annotations
 
@@ -46,6 +46,11 @@ async def docs_list(
     user_id: str = Depends(require_authenticated_user_id),
     _: None = Depends(require_space_access),
 ) -> list[dict[str, Any]]:
+    """Список документов пространства.
+
+    С заголовком `X-Space-Id` — документы этого space; без него — первое доступное пространство пользователя.
+    Возвращает краткие записи: id, title, doc_type, updated_at. Требуется Bearer.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     space_id = request.headers.get("x-space-id")
@@ -96,6 +101,11 @@ async def docs_create(
     _: None = Depends(require_space_access),
     _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
+    """Создать документ в пространстве.
+
+    Обязателен `X-Space-Id`. Тело: title, content, doc_type (`document` | `knowledge_base`), опционально card_id.
+    Роль manager+. Возвращает краткую запись созданного документа.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -170,6 +180,10 @@ async def docs_detail(
     user_id: str = Depends(require_authenticated_user_id),
     _: None = Depends(require_space_access),
 ) -> dict[str, Any]:
+    """Получить документ по id: заголовок, контент (JSON блоков), тип, даты, привязка к карточке.
+
+    При переданном `X-Space-Id` документ должен принадлежать этому space, иначе 403.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     space_id = request.headers.get("x-space-id")
@@ -201,6 +215,10 @@ async def docs_patch(
     _: None = Depends(require_space_access),
     _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
+    """Обновить документ (title, content, doc_type).
+
+    Роль manager+. PATCH JSON перезаписывает указанные поля. Возвращает обновлённый объект как при GET.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}

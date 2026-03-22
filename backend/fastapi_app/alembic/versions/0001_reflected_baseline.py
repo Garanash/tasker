@@ -9,7 +9,7 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # Foundation/subset mode: таблицы уже созданы Django-майграциями,
+    # Foundation/subset mode: таблицы уже существуют в БД (исторически или из init.sql),
     # поэтому на этом шаге делаем базовую отметку.
     pass
 

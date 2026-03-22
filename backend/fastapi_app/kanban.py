@@ -4,9 +4,10 @@ Kanban API приложения AGBTasker: доски, колонки, доро�
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -18,13 +19,16 @@ from starlette import status
 from .deps import (
     ROLE_PRIORITY,
     get_effective_role,
+    normalize_org_role,
     require_authenticated_user_id,
     require_manager_role,
     require_space_access,
 )
-from .notifications import create_notification_for_org_members, ensure_notifications_table
+from .notifications import create_notification_for_org_members, create_notification_for_user, ensure_notifications_table
 from .auth import _ensure_user_avatar_url_column
 from . import state
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/kanban", tags=["kanban"])
 
@@ -48,6 +52,50 @@ WORKFLOW_DONE_COLUMN_NAME = "Выполнено"
 ARCHIVED_FIELD_KEY = "is_archived"
 ARCHIVED_AT_FIELD_KEY = "archived_at"
 ARCHIVED_EFFORT_SECONDS_FIELD_KEY = "archive_total_labor_seconds"
+PARTICIPANT_USER_IDS_FIELD_KEY = "participant_user_ids"
+
+
+def _normalize_user_id_for_acl(value: Any) -> str | None:
+    """Приводит user id из jsonb/строки к каноничному UUID-строковому виду для сравнения."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        try:
+            inner = json.loads(s)
+            if isinstance(inner, str):
+                s = inner.strip()
+        except Exception:
+            s = s[1:-1].strip().strip('"')
+    try:
+        return str(uuid.UUID(s))
+    except ValueError:
+        return s if s else None
+
+
+def _coerce_participant_user_ids_list(value: Any) -> list[str]:
+    raw: list[Any] = []
+    if isinstance(value, list):
+        raw = value
+    elif isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                raw = parsed
+        except Exception:
+            return []
+    else:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in raw:
+        nu = _normalize_user_id_for_acl(x)
+        if nu and nu not in seen:
+            seen.add(nu)
+            out.append(nu)
+    return out
 
 
 async def _ensure_kanban_extensions(conn: asyncpg.Connection) -> None:
@@ -178,7 +226,99 @@ async def _can_executor_work_with_card(conn: asyncpg.Connection, user_id: str, c
         card_id,
         user_id,
     )
-    return bool(assignee)
+    if assignee:
+        return True
+    participants = await conn.fetchrow(
+        """
+        SELECT 1
+        FROM core_cardfieldvalue fv
+        JOIN core_cardfielddefinition fd ON fd.id = fv.definition_id
+        WHERE fv.card_id = $1::uuid AND fd.key = $3
+          AND jsonb_typeof(fv.value) = 'array'
+          AND fv.value @> jsonb_build_array($2::text)
+        LIMIT 1
+        """,
+        card_id,
+        str(user_id),
+        PARTICIPANT_USER_IDS_FIELD_KEY,
+    )
+    return bool(participants)
+
+
+def _executor_can_see_card_on_grid(
+    executor_user_id: str,
+    card_id: str,
+    meta: dict[str, Any],
+    executor_assigned_card_ids: set[str],
+) -> bool:
+    """Как _can_executor_work_with_card: назначение, ответственный по полю или список «Ответственные»."""
+    if card_id in executor_assigned_card_ids:
+        return True
+    nu = _normalize_user_id_for_acl(executor_user_id)
+    if not nu:
+        return False
+    aid = _normalize_user_id_for_acl(meta.get("assignee_user_id"))
+    if aid and aid == nu:
+        return True
+    for pid in meta.get("participant_user_ids") or []:
+        if _normalize_user_id_for_acl(pid) == nu:
+            return True
+    return False
+
+
+async def _sync_cardassignment_from_assignee_user_id_value(
+    conn: asyncpg.Connection,
+    *,
+    card_id: str,
+    organization_id: str,
+    assignee_raw: Any,
+    assigned_by_user_id: str,
+) -> None:
+    """Синхронизирует core_cardassignment с полем assignee_user_id (сохранение через /field-values)."""
+    await _ensure_kanban_extensions(conn)
+
+    def _empty(v: Any) -> bool:
+        if v is None:
+            return True
+        if isinstance(v, str) and not v.strip():
+            return True
+        return False
+
+    if _empty(assignee_raw):
+        await conn.execute("DELETE FROM core_cardassignment WHERE card_id = $1::uuid", card_id)
+        return
+
+    aid = str(assignee_raw).strip()
+    try:
+        uuid.UUID(aid)
+    except ValueError:
+        return
+
+    exists = await conn.fetchrow(
+        "SELECT role FROM core_organizationmember WHERE organization_id = $1::uuid AND user_id = $2::uuid LIMIT 1",
+        organization_id,
+        aid,
+    )
+    if not exists:
+        return
+    if str(exists["role"] or "").strip().lower() != "executor":
+        return
+
+    now = datetime.now(timezone.utc)
+    await conn.execute("DELETE FROM core_cardassignment WHERE card_id = $1::uuid", card_id)
+    await conn.execute(
+        """
+        INSERT INTO core_cardassignment (id, card_id, user_id, assigned_by_id, assigned_at)
+        VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5)
+        ON CONFLICT (card_id, user_id) DO UPDATE
+        SET assigned_by_id = EXCLUDED.assigned_by_id, assigned_at = EXCLUDED.assigned_at
+        """,
+        str(uuid.uuid4()),
+        card_id,
+        aid,
+        assigned_by_user_id,
+        now,
+    )
 
 
 def _jsonish_bool(value: Any) -> bool:
@@ -517,6 +657,41 @@ def _coerce_tags_list(value: Any) -> list[str]:
     return []
 
 
+def _iso_timestamp(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (datetime, date)):
+        try:
+            return value.isoformat()
+        except Exception:
+            return None
+    return str(value) if str(value).strip() else None
+
+
+def _safe_optional_int(val: Any) -> int | None:
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _uuid_strings_for_query(ids: list[str]) -> list[str]:
+    """Только валидные UUID — иначе ANY($1::uuid[]) падает на «мусоре» в полях карточки."""
+    out: list[str] = []
+    for raw in ids:
+        s = str(raw).strip()
+        if not s:
+            continue
+        try:
+            uuid.UUID(s)
+        except ValueError:
+            continue
+        out.append(s)
+    return list(dict.fromkeys(out))
+
+
 def _card_lite(row: Any, meta: dict[str, Any] | None = None) -> dict[str, Any]:
     meta = meta or {}
     return {
@@ -524,9 +699,9 @@ def _card_lite(row: Any, meta: dict[str, Any] | None = None) -> dict[str, Any]:
         "title": row["title"] or "",
         "description": row["description"] or "",
         "card_type": row["card_type"] or "task",
-        "due_at": row["due_at"].isoformat() if row.get("due_at") else None,
-        "planned_start_at": row["planned_start_at"].isoformat() if row.get("planned_start_at") else None,
-        "planned_end_at": row["planned_end_at"].isoformat() if row.get("planned_end_at") else None,
+        "due_at": _iso_timestamp(row.get("due_at")),
+        "planned_start_at": _iso_timestamp(row.get("planned_start_at")),
+        "planned_end_at": _iso_timestamp(row.get("planned_end_at")),
         "track_id": str(row["track_id"]) if row.get("track_id") else None,
         "column_id": str(row["column_id"]),
         "priority": _coerce_priority_display(meta.get("priority")),
@@ -539,7 +714,7 @@ def _card_lite(row: Any, meta: dict[str, Any] | None = None) -> dict[str, Any]:
         "comments_count": int(meta.get("comments_count") or 0),
         "unread_comments_count": int(meta.get("unread_comments_count") or 0),
         "attachments_count": int(meta.get("attachments_count") or 0),
-        "estimate_points": int(row["estimate_points"]) if row.get("estimate_points") is not None else None,
+        "estimate_points": _safe_optional_int(row.get("estimate_points")),
     }
 
 
@@ -1406,214 +1581,230 @@ async def board_grid(
     """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
-    async with state.pg_pool.acquire() as conn:
-        await _ensure_kanban_extensions(conn)
-        board = await conn.fetchrow(
-            "SELECT id, name FROM core_board WHERE id = $1::uuid", board_id
-        )
-        if not board:
-            raise HTTPException(status_code=404, detail="Доска не найдена")
-        await _ensure_board_workflow(conn, board_id)
-        org_id = await conn.fetchval(
-            "SELECT s.organization_id FROM core_board b JOIN core_space s ON s.id = b.space_id WHERE b.id = $1::uuid",
-            board_id,
-        )
-        effective_role = await get_effective_role(user_id, str(org_id))
-
-        columns = await conn.fetch(
-            """
-            SELECT c.id, c.name, c.order_index, c.is_done, w."limit" AS wip_limit
-            FROM core_column c
-            LEFT JOIN core_wiplimit w
-              ON w.column_id = c.id AND w.board_id = c.board_id AND w.scope_type = 'column'
-            WHERE c.board_id = $1::uuid
-            ORDER BY c.order_index
-            """,
-            board_id,
-        )
-        cards = await conn.fetch(
-            "SELECT id, title, description, card_type, due_at, planned_start_at, planned_end_at, track_id, column_id, estimate_points FROM core_card WHERE board_id = $1::uuid ORDER BY updated_at DESC",
-            board_id,
-        )
-        tracks = await conn.fetch(
-            "SELECT id, name FROM core_track WHERE board_id = $1::uuid ORDER BY order_index",
-            board_id,
-        )
-
-        card_ids = [str(c["id"]) for c in cards]
-        card_meta: dict[str, dict[str, Any]] = {}
-        executor_assigned_card_ids: set[str] = set()
-        if card_ids:
-            rows = await conn.fetch(
-                """
-                SELECT fv.card_id, fd.key, fv.value
-                FROM core_cardfieldvalue fv
-                JOIN core_cardfielddefinition fd ON fd.id = fv.definition_id
-                WHERE fv.card_id = ANY($1::uuid[])
-                """,
-                card_ids,
+    board_id = (board_id or "").strip()
+    try:
+        uuid.UUID(board_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Некорректный идентификатор доски")
+    try:
+        async with state.pg_pool.acquire() as conn:
+            await _ensure_kanban_extensions(conn)
+            board = await conn.fetchrow(
+                "SELECT id, name FROM core_board WHERE id = $1::uuid", board_id
             )
-            for r in rows:
-                cid = str(r["card_id"])
-                meta = card_meta.setdefault(cid, {})
-                key = str(r["key"] or "")
-                value = r["value"]
-                if key == "priority":
-                    meta["priority"] = value if isinstance(value, str) else None
-                elif key == "tags":
-                    if isinstance(value, list):
-                        meta["tags"] = [str(v) for v in value]
-                    elif isinstance(value, str):
-                        parts = [x.strip() for x in value.split(",") if x.strip()]
-                        meta["tags"] = parts
-                elif key == "assignee_name":
-                    meta["assignee_name"] = value if isinstance(value, str) else None
-                elif key == "assignee_user_id":
-                    meta["assignee_user_id"] = value if isinstance(value, str) else None
-                elif key == ARCHIVED_FIELD_KEY:
-                    meta["is_archived"] = _jsonish_bool(value)
-                elif key == ARCHIVED_AT_FIELD_KEY:
-                    meta["archived_at"] = str(value).strip() if value is not None else None
-                elif key == ARCHIVED_EFFORT_SECONDS_FIELD_KEY:
-                    try:
-                        meta["archive_total_labor_seconds"] = float(value)
-                    except Exception:
-                        meta["archive_total_labor_seconds"] = 0.0
-                elif key == "blocked_count":
-                    try:
-                        meta["blocked_count"] = int(value)
-                    except Exception:
-                        meta["blocked_count"] = 0
-                elif key == "blocking_count":
-                    try:
-                        meta["blocking_count"] = int(value)
-                    except Exception:
-                        meta["blocking_count"] = 0
-
-            comments_stat = await conn.fetch(
-                """
-                SELECT c.id AS card_id,
-                       COUNT(cc.id)::int AS comments_count,
-                       COUNT(*) FILTER (WHERE cc.created_at > COALESCE(rs.last_seen_comment_at, to_timestamp(0)))::int AS unread_comments_count
-                FROM core_card c
-                LEFT JOIN core_cardcomment cc ON cc.card_id = c.id
-                LEFT JOIN core_cardcommentreadstate rs ON rs.card_id = c.id AND rs.user_id = $2::uuid
-                WHERE c.id = ANY($1::uuid[])
-                GROUP BY c.id, rs.last_seen_comment_at
-                """,
-                card_ids,
-                user_id,
+            if not board:
+                raise HTTPException(status_code=404, detail="Доска не найдена")
+            await _ensure_board_workflow(conn, board_id)
+            org_id = await conn.fetchval(
+                "SELECT s.organization_id FROM core_board b JOIN core_space s ON s.id = b.space_id WHERE b.id = $1::uuid",
+                board_id,
             )
-            for row in comments_stat:
-                cid = str(row["card_id"])
-                meta = card_meta.setdefault(cid, {})
-                meta["comments_count"] = int(row["comments_count"] or 0)
-                meta["unread_comments_count"] = int(row["unread_comments_count"] or 0)
-
-            attachments_stat = await conn.fetch(
-                "SELECT card_id, COUNT(*)::int AS attachments_count FROM core_attachment WHERE card_id = ANY($1::uuid[]) GROUP BY card_id",
-                card_ids,
-            )
-            for row in attachments_stat:
-                cid = str(row["card_id"])
-                meta = card_meta.setdefault(cid, {})
-                meta["attachments_count"] = int(row["attachments_count"] or 0)
-
-            assignee_ids: list[str] = []
-            for meta in card_meta.values():
-                aid = meta.get("assignee_user_id")
-                if aid and str(aid).strip():
-                    assignee_ids.append(str(aid).strip())
-            if assignee_ids:
-                unique_assignees = list({x for x in assignee_ids})
-                await _ensure_user_avatar_url_column(conn)
-                avatar_rows = await conn.fetch(
-                    """
-                    SELECT id::text AS id, COALESCE(NULLIF(trim(avatar_url), ''), '') AS avatar_url
-                    FROM core_user WHERE id = ANY($1::uuid[])
-                    """,
-                    unique_assignees,
+            if org_id is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Доска не привязана к пространству (нет организации)",
                 )
-                id_to_avatar = {str(r["id"]): (r["avatar_url"] or "").strip() for r in avatar_rows}
-                for meta in card_meta.values():
-                    aid = meta.get("assignee_user_id")
-                    if not aid:
-                        continue
-                    au = id_to_avatar.get(str(aid).strip())
-                    if au:
-                        meta["assignee_avatar_url"] = au
+            effective_role = await get_effective_role(user_id, str(org_id))
 
-            if effective_role == "executor":
-                assigned_rows = await conn.fetch(
-                    "SELECT card_id::text AS card_id FROM core_cardassignment WHERE user_id = $1::uuid",
+            columns = await conn.fetch(
+                """
+                SELECT c.id, c.name, c.order_index, c.is_done, w."limit" AS wip_limit
+                FROM core_column c
+                LEFT JOIN core_wiplimit w
+                  ON w.column_id = c.id AND w.board_id = c.board_id AND w.scope_type = 'column'
+                WHERE c.board_id = $1::uuid
+                ORDER BY c.order_index
+                """,
+                board_id,
+            )
+            cards = await conn.fetch(
+                "SELECT id, title, description, card_type, due_at, planned_start_at, planned_end_at, track_id, column_id, estimate_points FROM core_card WHERE board_id = $1::uuid ORDER BY updated_at DESC",
+                board_id,
+            )
+            tracks = await conn.fetch(
+                "SELECT id, name FROM core_track WHERE board_id = $1::uuid ORDER BY order_index",
+                board_id,
+            )
+    
+            card_ids = [str(c["id"]) for c in cards]
+            card_meta: dict[str, dict[str, Any]] = {}
+            executor_assigned_card_ids: set[str] = set()
+            if card_ids:
+                rows = await conn.fetch(
+                    """
+                    SELECT fv.card_id, fd.key, fv.value
+                    FROM core_cardfieldvalue fv
+                    JOIN core_cardfielddefinition fd ON fd.id = fv.definition_id
+                    WHERE fv.card_id = ANY($1::uuid[])
+                    """,
+                    card_ids,
+                )
+                for r in rows:
+                    cid = str(r["card_id"])
+                    meta = card_meta.setdefault(cid, {})
+                    key = str(r["key"] or "")
+                    value = r["value"]
+                    if key == "priority":
+                        meta["priority"] = value if isinstance(value, str) else None
+                    elif key == "tags":
+                        if isinstance(value, list):
+                            meta["tags"] = [str(v) for v in value]
+                        elif isinstance(value, str):
+                            parts = [x.strip() for x in value.split(",") if x.strip()]
+                            meta["tags"] = parts
+                    elif key == "assignee_name":
+                        meta["assignee_name"] = value if isinstance(value, str) else None
+                    elif key == "assignee_user_id":
+                        meta["assignee_user_id"] = _normalize_user_id_for_acl(value)
+                    elif key == PARTICIPANT_USER_IDS_FIELD_KEY:
+                        meta["participant_user_ids"] = _coerce_participant_user_ids_list(value)
+                    elif key == ARCHIVED_FIELD_KEY:
+                        meta["is_archived"] = _jsonish_bool(value)
+                    elif key == ARCHIVED_AT_FIELD_KEY:
+                        meta["archived_at"] = str(value).strip() if value is not None else None
+                    elif key == ARCHIVED_EFFORT_SECONDS_FIELD_KEY:
+                        try:
+                            meta["archive_total_labor_seconds"] = float(value)
+                        except Exception:
+                            meta["archive_total_labor_seconds"] = 0.0
+                    elif key == "blocked_count":
+                        try:
+                            meta["blocked_count"] = int(value)
+                        except Exception:
+                            meta["blocked_count"] = 0
+                    elif key == "blocking_count":
+                        try:
+                            meta["blocking_count"] = int(value)
+                        except Exception:
+                            meta["blocking_count"] = 0
+    
+                comments_stat = await conn.fetch(
+                    """
+                    SELECT c.id AS card_id,
+                           COUNT(cc.id)::int AS comments_count,
+                           COUNT(*) FILTER (WHERE cc.created_at > COALESCE(rs.last_seen_comment_at, to_timestamp(0)))::int AS unread_comments_count
+                    FROM core_card c
+                    LEFT JOIN core_cardcomment cc ON cc.card_id = c.id
+                    LEFT JOIN core_cardcommentreadstate rs ON rs.card_id = c.id AND rs.user_id = $2::uuid
+                    WHERE c.id = ANY($1::uuid[])
+                    GROUP BY c.id, rs.last_seen_comment_at
+                    """,
+                    card_ids,
                     user_id,
                 )
-                executor_assigned_card_ids = {str(r["card_id"]) for r in assigned_rows}
+                for row in comments_stat:
+                    cid = str(row["card_id"])
+                    meta = card_meta.setdefault(cid, {})
+                    meta["comments_count"] = int(row["comments_count"] or 0)
+                    meta["unread_comments_count"] = int(row["unread_comments_count"] or 0)
+    
+                attachments_stat = await conn.fetch(
+                    "SELECT card_id, COUNT(*)::int AS attachments_count FROM core_attachment WHERE card_id = ANY($1::uuid[]) GROUP BY card_id",
+                    card_ids,
+                )
+                for row in attachments_stat:
+                    cid = str(row["card_id"])
+                    meta = card_meta.setdefault(cid, {})
+                    meta["attachments_count"] = int(row["attachments_count"] or 0)
+    
+                assignee_ids: list[str] = []
+                for meta in card_meta.values():
+                    aid = meta.get("assignee_user_id")
+                    if aid and str(aid).strip():
+                        assignee_ids.append(str(aid).strip())
+                if assignee_ids:
+                    unique_assignees = _uuid_strings_for_query(assignee_ids)
+                    if unique_assignees:
+                        await _ensure_user_avatar_url_column(conn)
+                        avatar_rows = await conn.fetch(
+                            """
+                            SELECT id::text AS id, COALESCE(NULLIF(trim(avatar_url), ''), '') AS avatar_url
+                            FROM core_user WHERE id = ANY($1::uuid[])
+                            """,
+                            unique_assignees,
+                        )
+                    else:
+                        avatar_rows = []
+                    id_to_avatar = {str(r["id"]): (r["avatar_url"] or "").strip() for r in avatar_rows}
+                    for meta in card_meta.values():
+                        aid = meta.get("assignee_user_id")
+                        if not aid:
+                            continue
+                        au = id_to_avatar.get(str(aid).strip())
+                        if au:
+                            meta["assignee_avatar_url"] = au
 
-    col_name_by_id = {str(c["id"]): str(c["name"] or "") for c in columns}
-    col_id_by_name = {str(c["name"] or ""): str(c["id"]) for c in columns}
-    todo_col_id = col_id_by_name.get(WORKFLOW_TODO_COLUMN_NAME)
-    in_progress_col_id = col_id_by_name.get(WORKFLOW_IN_PROGRESS_COLUMN_NAME)
+                if effective_role == "executor":
+                    assigned_rows = await conn.fetch(
+                        "SELECT card_id::text AS card_id FROM core_cardassignment WHERE user_id = $1::uuid",
+                        user_id,
+                    )
+                    executor_assigned_card_ids = {str(r["card_id"]) for r in assigned_rows}
 
-    by_col = {str(c["id"]): [] for c in columns}
-    valid_col_ids = set(by_col.keys())
-    fallback_column_id: str | None = None
-    if columns:
+        col_name_by_id = {str(c["id"]): str(c["name"] or "") for c in columns}
+        col_id_by_name = {str(c["name"] or ""): str(c["id"]) for c in columns}
         backlog_id = col_id_by_name.get(DEFAULT_BACKLOG_COLUMN_NAME)
-        fallback_column_id = str(backlog_id) if backlog_id and backlog_id in valid_col_ids else str(columns[0]["id"])
 
-    for card in cards:
-        cid = str(card["id"])
-        meta = card_meta.get(cid, {})
-        if _jsonish_bool(meta.get("is_archived")):
-            continue
-        if effective_role == "executor" and cid not in executor_assigned_card_ids:
-            continue
-
-        original_column_id = str(card["column_id"])
-        target_column_id = original_column_id
-        if (
-            effective_role in {"manager", "admin"}
-            and meta.get("assignee_user_id")
-            and todo_col_id
-            and in_progress_col_id
-            and original_column_id == todo_col_id
-        ):
-            # Для manager/admin назначенная задача визуально считается «В работе».
-            target_column_id = in_progress_col_id
-
-        if target_column_id not in valid_col_ids:
-            # Карточка ссылается на удалённую/чужую колонку — без падения сетки кладём в запасную.
-            if fallback_column_id and fallback_column_id in valid_col_ids:
-                target_column_id = fallback_column_id
-            else:
+        by_col = {str(c["id"]): [] for c in columns}
+        valid_col_ids = set(by_col.keys())
+        fallback_column_id: str | None = None
+        if columns:
+            fallback_column_id = str(backlog_id) if backlog_id and backlog_id in valid_col_ids else str(columns[0]["id"])
+    
+        for card in cards:
+            cid = str(card["id"])
+            meta = card_meta.get(cid, {})
+            if _jsonish_bool(meta.get("is_archived")):
+                continue
+            if effective_role == "executor" and not _executor_can_see_card_on_grid(
+                user_id, cid, meta, executor_assigned_card_ids
+            ):
+                continue
+    
+            original_column_id = str(card["column_id"])
+            target_column_id = original_column_id
+            backlog_id_str = str(backlog_id) if backlog_id else ""
+            # Карточки из колонки «Задачи» исполнителю не показываем.
+            if effective_role == "executor" and backlog_id_str and original_column_id == backlog_id_str:
                 continue
 
-        card_payload = _card_lite(card, meta)
-        card_payload["column_id"] = target_column_id
-        card_payload["source_column_id"] = original_column_id
-        card_payload["source_column_name"] = col_name_by_id.get(original_column_id, "")
-        by_col[target_column_id].append(card_payload)
-
-    visible_columns = columns
-    if effective_role == "executor":
-        visible_columns = [c for c in columns if str(c["name"] or "").strip() != DEFAULT_BACKLOG_COLUMN_NAME]
-    return {
-        "board": {"id": str(board["id"]), "name": board["name"]},
-        "effective_role": effective_role,
-        "tracks": [{"id": str(t["id"]), "name": t["name"]} for t in tracks],
-        "columns": [
-            {
-                "id": str(c["id"]),
-                "name": c["name"],
-                "order_index": c["order_index"],
-                "is_done": c["is_done"],
-                "wip_limit": int(c["wip_limit"]) if c["wip_limit"] is not None else None,
-                "cards": by_col[str(c["id"])],
-            }
-            for c in visible_columns
-        ],
-    }
+            if target_column_id not in valid_col_ids:
+                # Карточка ссылается на удалённую/чужую колонку — без падения сетки кладём в запасную.
+                if fallback_column_id and fallback_column_id in valid_col_ids:
+                    target_column_id = fallback_column_id
+                else:
+                    continue
+    
+            card_payload = _card_lite(card, meta)
+            card_payload["column_id"] = target_column_id
+            card_payload["source_column_id"] = original_column_id
+            card_payload["source_column_name"] = col_name_by_id.get(original_column_id, "")
+            by_col[target_column_id].append(card_payload)
+    
+        visible_columns = columns
+        if effective_role == "executor":
+            visible_columns = [c for c in columns if str(c["name"] or "").strip() != DEFAULT_BACKLOG_COLUMN_NAME]
+        return {
+            "board": {"id": str(board["id"]), "name": board["name"]},
+            "effective_role": effective_role,
+            "tracks": [{"id": str(t["id"]), "name": t["name"]} for t in tracks],
+            "columns": [
+                {
+                    "id": str(c["id"]),
+                    "name": c["name"],
+                    "order_index": c["order_index"],
+                    "is_done": c["is_done"],
+                    "wip_limit": _safe_optional_int(c["wip_limit"]),
+                    "cards": by_col[str(c["id"])],
+                }
+                for c in visible_columns
+            ],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("board_grid failed board_id=%s", board_id)
+        raise HTTPException(status_code=500, detail="Ошибка загрузки сетки доски") from e
 
 
 async def _validate_wip(conn, board_id: str, to_column_id: str, card_id: str, org_id: str) -> str | None:
@@ -1694,12 +1885,6 @@ async def card_move(
             allowed = await _can_executor_work_with_card(conn, user_id, card_id)
             if not allowed:
                 raise HTTPException(status_code=403, detail="executor_card_forbidden")
-            allowed_transitions = {
-                (WORKFLOW_TODO_COLUMN_NAME, WORKFLOW_IN_PROGRESS_COLUMN_NAME),
-                (WORKFLOW_IN_PROGRESS_COLUMN_NAME, WORKFLOW_REVIEW_COLUMN_NAME),
-            }
-            if str(card["column_id"]) != str(to_column_id) and (from_col_name, to_col_name) not in allowed_transitions:
-                raise HTTPException(status_code=403, detail="executor_transition_forbidden")
 
         wip_err = await _validate_wip(conn, str(card["board_id"]), str(to_column_id), card_id, str(space["organization_id"]))
         if wip_err:
@@ -1746,6 +1931,40 @@ async def card_move(
                 "to_column_id": str(to_column_id),
             },
         )
+        if to_col_name == WORKFLOW_REVIEW_COLUMN_NAME and str(from_column_id) != str(to_column_id):
+            manager_rows = await conn.fetch(
+                """
+                SELECT user_id, role
+                FROM core_organizationmember
+                WHERE organization_id = $1::uuid
+                """,
+                str(space["organization_id"]),
+            )
+            notified_manager_ids: set[str] = set()
+            for row in manager_rows:
+                manager_id = str(row["user_id"])
+                if manager_id == user_id:
+                    continue
+                normalized_role = normalize_org_role(str(row["role"] or ""))
+                if ROLE_PRIORITY.get(normalized_role, 0) < ROLE_PRIORITY["manager"]:
+                    continue
+                if manager_id in notified_manager_ids:
+                    continue
+                notified_manager_ids.add(manager_id)
+                await create_notification_for_user(
+                    conn=conn,
+                    organization_id=str(space["organization_id"]),
+                    user_id=manager_id,
+                    kind="card_review_required",
+                    title="Карточка ожидает проверки",
+                    body=f"{card_title or 'Карточка'} переведена в статус «{WORKFLOW_REVIEW_COLUMN_NAME}»",
+                    metadata={
+                        "card_id": card_id,
+                        "board_id": str(card["board_id"]),
+                        "from_column_id": str(from_column_id),
+                        "to_column_id": str(to_column_id),
+                    },
+                )
         updated = await conn.fetchrow(
             "SELECT id, title, description, card_type, due_at, planned_start_at, planned_end_at, track_id, column_id FROM core_card WHERE id = $1::uuid",
             card_id,
@@ -2730,7 +2949,7 @@ async def upsert_card_field_value(
     async with state.pg_pool.acquire() as conn:
         card = await conn.fetchrow(
             """
-            SELECT c.id, b.space_id
+            SELECT c.id, b.space_id, s.organization_id
             FROM core_card c
             JOIN core_board b ON b.id = c.board_id
             JOIN core_space s ON s.id = b.space_id
@@ -2794,6 +3013,14 @@ async def upsert_card_field_value(
                 definition_id,
                 serialized,
                 now,
+            )
+        if key == "assignee_user_id":
+            await _sync_cardassignment_from_assignee_user_id_value(
+                conn,
+                card_id=card_id,
+                organization_id=str(card["organization_id"]),
+                assignee_raw=value,
+                assigned_by_user_id=user_id,
             )
         detail = await _card_detail_dict(conn, card_id)
     if not detail:

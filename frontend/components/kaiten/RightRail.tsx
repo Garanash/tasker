@@ -1,8 +1,7 @@
 "use client";
 
-import { Box, IconButton, Tooltip, Divider, Badge } from "@mui/material";
+import { Box, IconButton, Tooltip } from "@mui/material";
 import GridViewIcon from "@mui/icons-material/GridView";
-import FilterListIcon from "@mui/icons-material/FilterList";
 import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
 import BarChartOutlinedIcon from "@mui/icons-material/BarChartOutlined";
 import ArchiveOutlinedIcon from "@mui/icons-material/ArchiveOutlined";
@@ -11,48 +10,40 @@ const TEXT_GRAY = "var(--k-text-muted)";
 const TEXT_DARK = "var(--k-text)";
 const BORDER_GRAY = "var(--k-border)";
 const LIGHT_BG = "var(--k-surface-bg)";
-const ACCENT_BLUE = "#1976D2";
 
 type Props = {
   activeTabId?: string;
   onTabChange?: (tabId: string) => void;
-  unreadNotificationsCount?: number;
   language?: "ru" | "en";
 };
 
 const RAIL_ITEMS = [
   { id: "lists", icon: <GridViewIcon sx={{ fontSize: 20 }} /> },
-  { id: "filters", icon: <FilterListIcon sx={{ fontSize: 20 }} /> },
   { id: "settings", icon: <DescriptionOutlinedIcon sx={{ fontSize: 20 }} /> },
   { id: "reports", icon: <BarChartOutlinedIcon sx={{ fontSize: 20 }} /> },
   { id: "archive", icon: <ArchiveOutlinedIcon sx={{ fontSize: 20 }} /> },
 ] as const;
 
-export default function RightRail({ activeTabId, onTabChange, unreadNotificationsCount = 0, language = "ru" }: Props) {
+export default function RightRail({ activeTabId, onTabChange, language = "ru" }: Props) {
   const t =
     language === "en"
       ? {
-          lists: "Board",
-          filters: "Filters",
+          lists: "Tasks",
           settings: "Documents",
           reports: "Reports",
           archive: "Archive",
-          notifications: "Unread notifications",
         }
       : {
-          lists: "Доска",
-          filters: "Фильтры",
+          lists: "Задачи",
           settings: "Документы",
           reports: "Отчеты",
           archive: "Архив",
-          notifications: "Непрочитанные уведомления",
         };
   const localizedItems = [
     { ...RAIL_ITEMS[0], title: t.lists },
-    { ...RAIL_ITEMS[1], title: t.filters },
-    { ...RAIL_ITEMS[2], title: t.settings },
-    { ...RAIL_ITEMS[3], title: t.reports },
-    { ...RAIL_ITEMS[4], title: t.archive },
+    { ...RAIL_ITEMS[1], title: t.settings },
+    { ...RAIL_ITEMS[2], title: t.reports },
+    { ...RAIL_ITEMS[3], title: t.archive },
   ];
   return (
     <Box
@@ -69,33 +60,6 @@ export default function RightRail({ activeTabId, onTabChange, unreadNotification
         py: 1,
       }}
     >
-      {/* Номер с задачами */}
-      <Tooltip title={t.notifications} placement="left" arrow>
-        <Badge badgeContent={unreadNotificationsCount} color="error" max={99}>
-          <Box
-            sx={{
-              width: 28,
-              height: 28,
-              bgcolor: "#E3F2FD",
-              color: ACCENT_BLUE,
-              borderRadius: "50%",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              fontSize: 13,
-              fontWeight: 600,
-              mb: 1,
-            }}
-            aria-label={t.notifications}
-          >
-            {Math.max(0, unreadNotificationsCount)}
-          </Box>
-        </Badge>
-      </Tooltip>
-
-      <Divider sx={{ width: 32, mb: 1, borderColor: BORDER_GRAY }} />
-
-      {/* Основные кнопки */}
       <Box
         sx={{
           flex: 1,
@@ -104,6 +68,7 @@ export default function RightRail({ activeTabId, onTabChange, unreadNotification
           alignItems: "center",
           gap: 0.25,
           overflow: "auto",
+          width: "100%",
         }}
       >
         {localizedItems.map((item) => (

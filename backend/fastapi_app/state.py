@@ -8,7 +8,9 @@ if TYPE_CHECKING:
     import asyncpg
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
+REDIS_URL = os.environ.get("REDIS_URL", "").strip() or None
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-key-change-me")
 
 pg_pool: "asyncpg.Pool | None" = None
 manager: Any = None  # WsBoardConnectionManager, set in main
+dm_manager: Any = None  # WsDmConnectionManager, set in main

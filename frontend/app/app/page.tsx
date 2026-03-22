@@ -1,4 +1,13 @@
 "use client";
 
-export { default } from "./page_impl_gray";
+import { Suspense } from "react";
+import PageImpl from "./page_impl_gray";
+
+export default function AppPage() {
+  return (
+    <Suspense fallback={null}>
+      <PageImpl />
+    </Suspense>
+  );
+}
 

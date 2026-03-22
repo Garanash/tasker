@@ -130,6 +130,98 @@ export default function TimelineView({ cards, onCardClick, locale = "ru" }: Prop
           today: "Сегодня",
           resource: "▲ Ресурсное планирование",
         };
+  const escapeCsv = (value: unknown): string => {
+    const raw = value == null ? "" : String(value);
+    return `"${raw.replace(/"/g, '""')}"`;
+  };
+  const downloadTimelineCsv = (detailed: boolean) => {
+    const headers = detailed
+      ? [
+          locale === "en" ? "Title" : "Название",
+          "ID",
+          locale === "en" ? "Board" : "Доска",
+          locale === "en" ? "Track" : "Дорожка",
+          locale === "en" ? "Column" : "Колонка",
+          locale === "en" ? "Assignee" : "Ответственный",
+          locale === "en" ? "Start" : "Старт",
+          locale === "en" ? "End" : "Финиш",
+          locale === "en" ? "Priority" : "Приоритет",
+          locale === "en" ? "Tags" : "Теги",
+        ]
+      : [
+          locale === "en" ? "Title" : "Название",
+          "ID",
+          locale === "en" ? "Board" : "Доска",
+          locale === "en" ? "Dates" : "Даты",
+          locale === "en" ? "Assignee" : "Ответственный",
+        ];
+    const lines = [
+      headers.map(escapeCsv).join(","),
+      ...cards.map((c) => {
+        const start = formatCardDate(c.planned_start_at || c.due_at, locale) || "—";
+        const end = formatCardDate(c.planned_end_at || c.due_at, locale) || "—";
+        const row = detailed
+          ? [
+              c.title,
+              c.id.slice(0, 8),
+              c.board_name || "—",
+              c.track_name || "—",
+              c.column_name || "—",
+              c.assignee_name || "—",
+              start,
+              end,
+              normalizeKanbanPriority(c.priority) || "—",
+              (c.tags || []).join(", "),
+            ]
+          : [c.title, c.id.slice(0, 8), c.board_name || "—", `${start} — ${end}`, c.assignee_name || "—"];
+        return row.map(escapeCsv).join(",");
+      }),
+    ];
+    const blob = new Blob(["\uFEFF" + lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = detailed
+      ? locale === "en"
+        ? "timeline-detailed-report.csv"
+        : "timeline-развернутый-отчет.csv"
+      : locale === "en"
+        ? "timeline-report.csv"
+        : "timeline-отчет.csv";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  };
+  const openTimelinePrintForm = () => {
+    const title = locale === "en" ? "Timeline Report" : "Отчет по таймлайну";
+    const generatedAt = new Date().toLocaleString(locale === "en" ? "en-US" : "ru-RU");
+    const rows = cards
+      .map((c) => {
+        const start = formatCardDate(c.planned_start_at || c.due_at, locale) || "—";
+        const end = formatCardDate(c.planned_end_at || c.due_at, locale) || "—";
+        return `<tr><td>${c.title}</td><td>${c.id.slice(0, 8)}</td><td>${c.board_name || "—"}</td><td>${c.track_name || "—"}</td><td>${c.column_name || "—"}</td><td>${c.assignee_name || "—"}</td><td>${start} — ${end}</td></tr>`;
+      })
+      .join("");
+    const win = window.open("", "_blank", "noopener,noreferrer,width=1280,height=900");
+    if (!win) return;
+    win.document.write(`
+      <!doctype html><html><head><meta charset="utf-8"/><title>${title}</title>
+      <style>
+        body{font-family:Inter,-apple-system,Segoe UI,Roboto,sans-serif;margin:24px;color:#111}
+        h1{margin:0 0 8px;font-size:24px}.meta{margin:0 0 16px;color:#555;font-size:12px}
+        table{width:100%;border-collapse:collapse;font-size:12px}
+        th,td{border:1px solid #cfd2d7;padding:8px;text-align:left;vertical-align:top}
+        th{background:#f3f4f6;font-weight:700}tr:nth-child(even) td{background:#fafafa}
+      </style></head><body>
+      <h1>${title}</h1><div class="meta">${generatedAt}</div>
+      <table><thead><tr>
+      <th>${locale === "en" ? "Title" : "Название"}</th><th>ID</th><th>${locale === "en" ? "Board" : "Доска"}</th><th>${locale === "en" ? "Track" : "Дорожка"}</th><th>${locale === "en" ? "Column" : "Колонка"}</th><th>${locale === "en" ? "Assignee" : "Ответственный"}</th><th>${locale === "en" ? "Dates" : "Даты"}</th>
+      </tr></thead><tbody>${rows}</tbody></table>
+      </body></html>`);
+    win.document.close();
+    win.focus();
+  };
 
   const today = new Date();
   const currentMonth = today.getMonth();
@@ -199,18 +291,21 @@ export default function TimelineView({ cards, onCardClick, locale = "ru" }: Prop
         <Box sx={{ flex: 1 }} />
         <Box
           component="button"
+          onClick={() => downloadTimelineCsv(true)}
           sx={{ px: 2, py: 1, bgcolor: "var(--k-surface-bg)", color: "var(--k-text)", border: "1px solid var(--k-border)", borderRadius: 1, fontSize: 13, cursor: "pointer" }}
         >
           ⬇ {t.downloadFull}
         </Box>
         <Box
           component="button"
+          onClick={() => downloadTimelineCsv(false)}
           sx={{ px: 2, py: 1, bgcolor: "var(--k-surface-bg)", color: "var(--k-text)", border: "1px solid var(--k-border)", borderRadius: 1, fontSize: 13, cursor: "pointer" }}
         >
           ⬇ {t.download}
         </Box>
         <Box
           component="button"
+          onClick={openTimelinePrintForm}
           sx={{ px: 2, py: 1, bgcolor: "var(--k-surface-bg)", color: "var(--k-text)", border: "1px solid var(--k-border)", borderRadius: 1, fontSize: 13, cursor: "pointer" }}
         >
           ⚙ {t.settings}
@@ -247,6 +342,9 @@ export default function TimelineView({ cards, onCardClick, locale = "ru" }: Prop
                         sx={{ width: 16, height: 16, bgcolor: "#9C27B0", borderRadius: 0.5, display: "inline-block" }}
                       />
                       {card.title}
+                    </Typography>
+                    <Typography sx={{ fontSize: 11, color: "var(--k-text-muted)", mt: 0.25 }}>
+                      {(locale === "en" ? "Assignee" : "Ответственный") + ": " + (card.assignee_name || "—")}
                     </Typography>
                   </Box>
                   <Box sx={{ width: 80, p: 1, fontSize: 12, color: "var(--k-text-muted)" }}>{card.id.slice(0, 8)}</Box>

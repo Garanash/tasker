@@ -17,6 +17,8 @@ type Props = {
   onClose: () => void;
   token: string;
   activeSpaceId?: string | null;
+  /** Организация для нового пространства (если нет активного space). */
+  activeOrganizationId?: string | null;
   refreshToken?: string;
   onTokensUpdated?: (tokens: { access: string; refresh?: string }) => void;
   onAuthExpired?: () => void;
@@ -28,6 +30,7 @@ export default function CreateSpaceDialog({
   onClose,
   token,
   activeSpaceId,
+  activeOrganizationId,
   refreshToken,
   onTokensUpdated,
   onAuthExpired,
@@ -52,6 +55,7 @@ export default function CreateSpaceDialog({
             "Content-Type": "application/json",
             Authorization: `Bearer ${accessToken}`,
             ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
+            ...(!activeSpaceId && activeOrganizationId ? { "X-Organization-Id": activeOrganizationId } : {}),
           },
           body: JSON.stringify({ name: name.trim() }),
         });

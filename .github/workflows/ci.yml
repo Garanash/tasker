@@ -32,19 +32,41 @@ jobs:
         working-directory: frontend
         run: npm run test:e2e
 
-  backend-tests:
+  backend-smoke:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Start backend dependencies
+      - name: Start db + redis + backend
         run: docker compose up -d db redis backend
 
-      - name: Run Django tests
-        run: docker compose exec -T backend python manage.py test core
+      - name: Wait for API (live + DB ready)
+        run: |
+          for i in $(seq 1 45); do
+            if curl -sf http://localhost:8000/health/live >/dev/null; then
+              echo "live ok"
+              break
+            fi
+            if [ "$i" -eq 45 ]; then
+              echo "Timeout waiting for /health/live" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          for i in $(seq 1 45); do
+            if curl -sf http://localhost:8000/health/ready >/dev/null; then
+              echo "ready ok"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Timeout waiting for /health/ready" >&2
+          exit 1
+
+      - name: Import FastAPI app
+        run: docker compose exec -T backend python -c "from fastapi_app.main import app; assert app.title"
 
       - name: Shutdown
         if: always()
         run: docker compose down -v --remove-orphans
-

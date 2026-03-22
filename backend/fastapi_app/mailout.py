@@ -46,6 +46,22 @@ _LOGIN_OTP_HTML = """<!DOCTYPE html>
   </div>
 </body></html>"""
 
+_PASSWORD_RESET_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="font-family:Segoe UI,Roboto,Arial,sans-serif;background:#0a0a0a;color:#e0e0e0;padding:24px;">
+  <div style="max-width:520px;margin:0 auto;background:#111;border:1px solid #2a2a2a;border-radius:16px;padding:28px;">
+    <h1 style="font-size:22px;margin:0 0 12px;color:#fff;">Сброс пароля</h1>
+    <p style="color:#a0a0a0;font-size:15px;">Здравствуйте, <strong style="color:#e0e0e0;">{safe_display}</strong>!</p>
+    <p style="color:#a0a0a0;font-size:15px;">Чтобы задать новый пароль для AGB Tasks, перейдите по ссылке (действительна 1 час):</p>
+    <p style="margin:24px 0;">
+      <a href="{safe_link}" style="display:inline-block;padding:14px 24px;background:linear-gradient(90deg,#8a2be2,#4b0082);
+         color:#fff;text-decoration:none;border-radius:999px;font-weight:600;font-size:15px;">Установить новый пароль</a>
+    </p>
+    <p style="color:#707070;font-size:12px;word-break:break-all;">Если кнопка не работает, скопируйте адрес:<br/>{safe_link}</p>
+    <p style="color:#707070;font-size:13px;margin-top:24px;">Если вы не запрашивали сброс — проигнорируйте письмо.<br/>Администратор системы</p>
+  </div>
+</body></html>"""
+
 
 def is_smtp_configured() -> bool:
     return bool(os.environ.get("SMTP_HOST") and os.environ.get("SMTP_USER") and os.environ.get("SMTP_PASSWORD"))
@@ -92,6 +108,20 @@ async def send_html_mail(to_addr: str, subject: str, html_body: str, text_body: 
     if not is_smtp_configured():
         logger.warning("SMTP не настроен (SMTP_HOST / SMTP_USER / SMTP_PASSWORD) — письмо на %s не отправлено", to_addr)
         return False, "mail_not_configured"
+    broker = (os.environ.get("CELERY_BROKER_URL") or "").strip()
+    if broker:
+        from .tasks import send_html_mail_task
+
+        async_result = send_html_mail_task.apply_async(args=[to_addr, subject, html_body, text_body])
+        try:
+            res = await asyncio.to_thread(async_result.get, 60)
+        except Exception as e:
+            logger.exception("Celery mail task failed for %s", to_addr)
+            return False, str(e)
+        if isinstance(res, dict) and res.get("ok"):
+            return True, None
+        err = (res or {}).get("err") if isinstance(res, dict) else "mail_failed"
+        return False, str(err)
     try:
         await asyncio.to_thread(_send_smtp_sync, to_addr, subject, html_body, text_body)
         return True, None
@@ -134,4 +164,19 @@ def build_login_otp_email(full_name: str, email: str, code: str) -> tuple[str, s
         f"Администратор системы\n"
     )
     html_body = _LOGIN_OTP_HTML.format(safe_display=safe_display, safe_code=safe_code)
+    return subject, html_body, text
+
+
+def build_password_reset_email(full_name: str, email: str, reset_link: str) -> tuple[str, str, str]:
+    subject = "Сброс пароля — AGB Tasks"
+    display = (full_name or "").strip() or email
+    safe_display = html_escape(display)
+    safe_link = html_escape(reset_link)
+    text = (
+        f"Здравствуйте, {display}!\n\n"
+        f"Для сброса пароля AGB Tasks перейдите по ссылке (действительна 1 час):\n{reset_link}\n\n"
+        f"Если вы не запрашивали сброс, проигнорируйте это письмо.\n\n"
+        f"Администратор системы\n"
+    )
+    html_body = _PASSWORD_RESET_HTML.format(safe_display=safe_display, safe_link=safe_link)
     return subject, html_body, text

@@ -1,0 +1,8 @@
+# TLS настроен в default.conf: listen 443 ssl, сертификаты из /etc/letsencrypt (монтируется в docker-compose.prod.yml).
+# Параметры шифров — snippets/ssl-params.conf.
+# Первый выпуск сертификата на сервере (порт 80 свободен):
+#   docker compose -f docker-compose.prod.yml stop nginx
+#   certbot certonly --standalone -d agbtasker.ru -d www.agbtasker.ru --email ВАШ_EMAIL --agree-tos --non-interactive
+# Далее перевод на webroot (без простоя при продлении):
+#   certbot certonly --webroot -w /opt/kaiten_copy/deploy/certbot/www -d agbtasker.ru -d www.agbtasker.ru --cert-name agbtasker.ru --force-renewal --non-interactive
+# После продления: deploy/certbot/deploy-hook-reload-nginx.sh в [renewalparams] certbot.

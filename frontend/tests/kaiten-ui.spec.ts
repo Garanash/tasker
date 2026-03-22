@@ -7,35 +7,31 @@ test("Kaiten UI: хедер, drawer, rail, вкладки (реальный API)
   await page.goto("http://localhost:3000/app");
 
   const emailInput = page.locator('input[type="email"]');
-  const passwordInput = page.locator('input[type="password"]');
 
+  /** Вход только по OTP; без кода из письма автологин недоступен — подставьте JWT через E2E_ACCESS_TOKEN. */
   if (await emailInput.isVisible({ timeout: 5000 }).catch(() => false)) {
-    await page.getByRole("button", { name: "Вход" }).first().click();
-    await emailInput.fill("e2e@test.com");
-    await passwordInput.fill("password123");
-    await page.getByRole("button", { name: "Вход" }).nth(1).click();
-    await expect(page.getByTestId("app-brand")).toBeVisible({ timeout: 30_000 });
+    const token = process.env.E2E_ACCESS_TOKEN;
+    if (token) {
+      await page.evaluate((t) => localStorage.setItem("kaiten_access", t), token);
+      await page.reload();
+      await expect(page.getByTestId("app-brand")).toBeVisible({ timeout: 30_000 });
+    } else {
+      test.skip(true, "Задайте E2E_ACCESS_TOKEN или войдите вручную — форма входа только по коду из письма");
+    }
   }
 
-  await expect(page.getByTestId("app-brand")).toContainText("Almazgeobur tasks");
+  await expect(page.getByTestId("app-brand")).toContainText("AGB Tasks");
   await expect(page.getByTestId("menu-button")).toBeVisible();
-  await expect(page.getByTestId("header-buttons")).toBeVisible();
   await expect(page.getByTestId("header-search")).toBeVisible();
+  await expect(page.getByTestId("header-messages")).toBeVisible();
   await expect(page.getByTestId("right-rail")).toBeVisible();
 
   await page.getByTestId("menu-button").click();
   await expect(page.getByTestId("left-navigation-drawer")).toBeVisible();
   await page.keyboard.press("Escape");
 
-  await expect(page.getByTestId("header-btn-lists")).toBeVisible();
-  await expect(page.getByText("Списки")).toBeVisible();
-  await expect(page.getByText("Отчёты")).toBeVisible();
-  await expect(page.getByText("Архив")).toBeVisible();
   await expect(page.getByText("Фильтры")).toBeVisible();
 
   await expect(page.locator("#app-container")).toBeVisible();
   await expect(page.locator("#boardsContainer, #app-container").first()).toBeVisible();
-
-  await page.getByTestId("header-btn-reports").click();
-  await expect(page.getByText("Отчёты будут доступны")).toBeVisible({ timeout: 5_000 });
 });

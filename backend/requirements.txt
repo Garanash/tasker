@@ -12,8 +12,12 @@ sqlalchemy>=2.0.0
 alembic>=1.13.0
 psycopg[binary]>=3.2.0
 
-# Scheduler (deadline automations)
+# Scheduler (deadline automations, dev без Celery Beat)
 apscheduler>=3.10.0
+
+# Celery + Redis (прод: воркер, beat, почта, автоматизации)
+celery[redis]>=5.4.0
+redis>=5.0.0
 
 # Optional: files (S3)
 boto3>=1.35.0

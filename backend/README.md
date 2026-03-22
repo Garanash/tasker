@@ -1,6 +1,6 @@
-# Kaiten Clone API (FastAPI)
+# AGBTasker API (FastAPI)
 
-Бэкенд без Django: только FastAPI, asyncpg, JWT, WebSocket.
+Асинхронный FastAPI, PostgreSQL (asyncpg), JWT, WebSocket, опционально Celery + Redis.
 
 ## Запуск
 
@@ -21,7 +21,7 @@ docker-compose up -d db backend
 
 При первом запуске база должна содержать таблицы `core_*`. Варианты:
 
-1. **Уже есть БД от старой версии (Django)** — просто укажите `DATABASE_URL`.
+1. **Уже есть БД с таблицами `core_*`** — укажите `DATABASE_URL` на PostgreSQL.
 2. **Новая БД** — примените схему из `schema/init.sql`:
    ```bash
    psql "$DATABASE_URL" -f schema/init.sql
@@ -34,8 +34,15 @@ docker-compose up -d db backend
 - `MEDIA_ROOT` — каталог для загружаемых файлов (по умолчанию `/tmp/kaiten_media`).
 - `MEDIA_URL` — префикс URL для медиа (по умолчанию `/media/`).
 - `CORS_ORIGINS` — (опционально, продакшен) список разрешённых origin через запятую, например `https://app.example.com`. Если не задано, разрешены только `localhost` / `127.0.0.1`.
+- `REDIS_URL` — Redis для Pub/Sub событий WebSocket с воркеров (например `redis://redis:6379/0`).
+- `CELERY_BROKER_URL` / `CELERY_RESULT_BACKEND` — если заданы (часто совпадают с Redis), почта уходит через Celery; иначе SMTP в потоке (`asyncio.to_thread`).
+- `USE_CELERY_BEAT=1` — отключить встроенный APScheduler и запускать deadline-автоматизации только через Celery Beat (как в `docker-compose.prod.yml`).
 
 Зависимость **`python-multipart`** обязательна для `POST .../attachments` с загрузкой файла (`multipart/form-data`); она указана в `requirements.txt`.
+
+Продакшен-сборка: см. корневой [README.md](../README.md) и `docker-compose.prod.yml`.
+
+Образ backend: [Dockerfile](Dockerfile) + `docker-entrypoint.sh` — процесс под пользователем `app` (uid 1000), если файлы в `/app` читаемы им; при bind-mount dev с «чужим» uid остаётся root (только для локальной разработки).
 
 ## API
 

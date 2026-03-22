@@ -35,7 +35,7 @@ async function login(request: APIRequestContext, email: string, password: string
 async function bootstrapRoleFixture(request: APIRequestContext) {
   const seed = Date.now().toString(36);
   const ownerEmail = `owner-${seed}@e2e.test`;
-  const leadEmail = `lead-${seed}@e2e.test`;
+  const managerEmail = `manager-${seed}@e2e.test`;
   const executorEmail = `exec-${seed}@e2e.test`;
   const password = "password123";
 
@@ -57,21 +57,21 @@ async function bootstrapRoleFixture(request: APIRequestContext) {
   const activeSpaceId = spaces[0]?.id;
   expect(activeSpaceId).toBeTruthy();
 
-  const createLead = await authRequest(
+  const createManager = await authRequest(
     request,
     "POST",
     "/api/auth/users",
     owner.access,
     {
-      email: leadEmail,
+      email: managerEmail,
       password,
-      full_name: "E2E Lead",
-      role: "user",
+      full_name: "E2E Manager",
+      role: "executor",
     },
     activeSpaceId
   );
-  expect(createLead.ok()).toBeTruthy();
-  const leadUser = (await createLead.json()) as { id: string };
+  expect(createManager.ok()).toBeTruthy();
+  const managerUser = (await createManager.json()) as { id: string };
 
   const createExecutor = await authRequest(
     request,
@@ -82,22 +82,22 @@ async function bootstrapRoleFixture(request: APIRequestContext) {
       email: executorEmail,
       password,
       full_name: "E2E Executor",
-      role: "user",
+      role: "executor",
     },
     activeSpaceId
   );
   expect(createExecutor.ok()).toBeTruthy();
   const executorUser = (await createExecutor.json()) as { id: string };
 
-  const setLeadRole = await authRequest(
+  const setManagerRole = await authRequest(
     request,
     "PATCH",
-    `/api/auth/users/${leadUser.id}/role`,
+    `/api/auth/users/${managerUser.id}/role`,
     owner.access,
-    { role: "lead" },
+    { role: "manager" },
     activeSpaceId
   );
-  expect(setLeadRole.ok()).toBeTruthy();
+  expect(setManagerRole.ok()).toBeTruthy();
 
   const setExecutorRole = await authRequest(
     request,
@@ -109,14 +109,14 @@ async function bootstrapRoleFixture(request: APIRequestContext) {
   );
   expect(setExecutorRole.ok()).toBeTruthy();
 
-  const leadTokens = await login(request, leadEmail, password);
+  const managerTokens = await login(request, managerEmail, password);
   const executorTokens = await login(request, executorEmail, password);
 
   const boardRes = await authRequest(
     request,
     "POST",
     "/api/kanban/boards",
-    leadTokens.access,
+    managerTokens.access,
     { name: `Board ${seed}`, space_id: activeSpaceId },
     activeSpaceId
   );
@@ -127,7 +127,7 @@ async function bootstrapRoleFixture(request: APIRequestContext) {
     request,
     "GET",
     `/api/kanban/boards/${board.id}/grid`,
-    leadTokens.access,
+    managerTokens.access,
     undefined,
     activeSpaceId
   );
@@ -140,7 +140,7 @@ async function bootstrapRoleFixture(request: APIRequestContext) {
     request,
     "POST",
     "/api/kanban/cards",
-    leadTokens.access,
+    managerTokens.access,
     {
       title: "E2E Assigned Task",
       description: "Role workflow task",
@@ -156,7 +156,7 @@ async function bootstrapRoleFixture(request: APIRequestContext) {
     request,
     "POST",
     `/api/kanban/cards/${card.id}/assignees`,
-    leadTokens.access,
+    managerTokens.access,
     { user_id: executorUser.id },
     activeSpaceId
   );
@@ -166,13 +166,13 @@ async function bootstrapRoleFixture(request: APIRequestContext) {
     request,
     "POST",
     `/api/kanban/boards/${board.id}/tracks`,
-    leadTokens.access,
+    managerTokens.access,
     { name: "E2E row" },
     activeSpaceId
   );
   expect(trackRes.ok()).toBeTruthy();
 
-  return { activeSpaceId, boardId: board.id, leadTokens, executorTokens };
+  return { activeSpaceId, boardId: board.id, managerTokens, executorTokens };
 }
 
 async function openAs(page: Page, access: string, refresh?: string) {
@@ -186,10 +186,10 @@ async function openAs(page: Page, access: string, refresh?: string) {
   await page.goto("http://localhost:3000/app");
 }
 
-test("Lead and executor role UI + tracks endpoint", async ({ request, page, browser }) => {
+test("Manager and executor role UI + tracks endpoint", async ({ request, page, browser }) => {
   const fixture = await bootstrapRoleFixture(request);
 
-  await openAs(page, fixture.leadTokens.access, fixture.leadTokens.refresh);
+  await openAs(page, fixture.managerTokens.access, fixture.managerTokens.refresh);
   await page.waitForTimeout(1500);
   await expect(page.locator("#boardsWrapper")).toBeVisible();
   await expect(page.getByText("Задачи")).toBeVisible();

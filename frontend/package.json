@@ -3,7 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
+    "clean": "rm -rf .next node_modules/.cache",
     "dev": "next dev -p 3000",
+    "dev:clean": "npm run clean && next dev -p 3000",
     "build": "next build",
     "start": "next start -p 3000",
     "lint": "next lint",
