@@ -1,9 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
+  Avatar,
   Box,
   Button,
+  CircularProgress,
   Collapse,
   Dialog,
   DialogActions,
@@ -14,6 +16,7 @@ import {
   InputBase,
   List,
   ListItem,
+  ListItemAvatar,
   ListItemButton,
   ListItemIcon,
   ListItemText,
@@ -42,6 +45,9 @@ import DashboardOutlinedIcon from "@mui/icons-material/DashboardOutlined";
 import MoreVertIcon from "@mui/icons-material/MoreVert";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import SearchIcon from "@mui/icons-material/Search";
+import BusinessIcon from "@mui/icons-material/Business";
+import MailOutlineIcon from "@mui/icons-material/MailOutline";
+import { getApiUrl } from "@/lib/api";
 
 const TEXT_GRAY = "var(--k-text-muted)";
 const TEXT_DARK = "var(--k-text)";
@@ -53,6 +59,55 @@ const SELECTED_BG = "rgba(127,127,127,0.22)";
 export type SidebarSpace = { id: string; name: string };
 export type SidebarBoard = { id: string; name: string; space_id?: string; project_id?: string };
 export type SidebarProject = { id: string; name: string; space_id?: string };
+export type SidebarOrganization = { id: string; name: string };
+export type SidebarOrgMember = {
+  id: string;
+  full_name: string;
+  email: string;
+  avatar_url?: string;
+  role: string;
+};
+
+function formatMemberRole(role: string, language: "ru" | "en"): string {
+  const r = (role || "executor").toLowerCase();
+  if (language === "en") {
+    const map: Record<string, string> = {
+      executor: "Executor",
+      manager: "Manager",
+      admin: "Administrator",
+    };
+    return map[r] || r;
+  }
+  const map: Record<string, string> = {
+    executor: "Исполнитель",
+    manager: "Менеджер",
+    admin: "Администратор",
+  };
+  return map[r] || r;
+}
+
+function resolveMemberAvatarSrc(url: string | undefined): string | undefined {
+  const u = (url || "").trim();
+  if (!u) return undefined;
+  if (u.startsWith("http://") || u.startsWith("https://")) return u;
+  if (u.startsWith("//")) return `https:${u}`;
+  return getApiUrl(u.startsWith("/") ? u : `/${u}`);
+}
+
+function memberInitials(fullName: string, email: string): string {
+  const n = fullName.trim();
+  if (n) {
+    const parts = n.split(/\s+/).filter(Boolean);
+    if (parts.length >= 2) return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+    return n.slice(0, 2).toUpperCase();
+  }
+  const e = email.trim();
+  return (e[0] || "?").toUpperCase();
+}
+
+function memberDisplayName(fullName: string, email: string): string {
+  return fullName.trim() || email;
+}
 
 type AddMenuAction =
   | "folder"
@@ -62,6 +117,16 @@ type AddMenuAction =
   | "board";
 
 type Props = {
+  organizations?: SidebarOrganization[];
+  activeOrganizationId?: string | null;
+  onSelectOrganization?: (organizationId: string) => void;
+  /** менеджер/админ в этой организации — показать переименование */
+  canRenameOrganization?: (organizationId: string) => boolean;
+  onRenameOrganization?: (organizationId: string, newName: string) => void | Promise<boolean | void>;
+  organizationMembers?: SidebarOrgMember[];
+  organizationMembersLoading?: boolean;
+  currentUserId?: string | null;
+  onOpenDirectMessage?: (member: SidebarOrgMember) => void;
   spaces: SidebarSpace[];
   projects?: SidebarProject[];
   boards: SidebarBoard[];
@@ -73,6 +138,8 @@ type Props = {
   onSelectProject?: (projectId: string) => void;
   onSelectBoard: (boardId: string) => void;
   onCreateSpace: () => void;
+  /** Левое меню «Доску» — как onCreateSpace, надёжно открывает диалог создания доски */
+  onCreateBoard?: () => void;
   onRenameSpace?: (spaceId: string, newName: string) => void | Promise<boolean>;
   onRenameBoard?: (boardId: string, newName: string) => void | Promise<boolean>;
   /** false = ошибка (диалог не закрываем). void / true = успех. */
@@ -86,7 +153,7 @@ type Props = {
   canOpenAdministration?: boolean;
   canCreateEntities?: boolean;
   canCreateSpace?: boolean;
-  /** lead/admin: переименование и удаление пространств */
+  /** менеджер/админ: переименование и удаление пространств */
   canManageSpaces?: boolean;
   /** manager+: переименование и удаление досок */
   canManageBoards?: boolean;
@@ -95,6 +162,15 @@ type Props = {
 };
 
 export default function LeftSidebar({
+  organizations = [],
+  activeOrganizationId = null,
+  onSelectOrganization,
+  canRenameOrganization,
+  onRenameOrganization,
+  organizationMembers = [],
+  organizationMembersLoading = false,
+  currentUserId = null,
+  onOpenDirectMessage,
   spaces,
   projects = [],
   boards,
@@ -106,6 +182,7 @@ export default function LeftSidebar({
   onSelectProject,
   onSelectBoard,
   onCreateSpace,
+  onCreateBoard,
   onRenameSpace,
   onRenameBoard,
   onDeleteSpace,
@@ -127,6 +204,10 @@ export default function LeftSidebar({
   const [menuExpanded, setMenuExpanded] = useState(true);
   const [personalExpanded, setPersonalExpanded] = useState(true);
   const [spacesExpanded, setSpacesExpanded] = useState(true);
+  const [orgSectionExpanded, setOrgSectionExpanded] = useState(true);
+  const [renameOrgDialog, setRenameOrgDialog] = useState<{ id: string; name: string } | null>(null);
+  const [renameOrgDraft, setRenameOrgDraft] = useState("");
+  const [renameOrgBusy, setRenameOrgBusy] = useState(false);
 
   const [editingSpaceId, setEditingSpaceId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
@@ -140,6 +221,12 @@ export default function LeftSidebar({
   const [deleteDialogSpace, setDeleteDialogSpace] = useState<{ id: string; name: string } | null>(null);
   const [renameDialogBoard, setRenameDialogBoard] = useState<{ id: string; name: string } | null>(null);
   const [deleteDialogBoard, setDeleteDialogBoard] = useState<{ id: string; name: string } | null>(null);
+
+  const organizationMembersOthers = useMemo(() => {
+    const me = (currentUserId || "").trim().toLowerCase();
+    if (!me) return organizationMembers;
+    return organizationMembers.filter((m) => String(m.id).trim().toLowerCase() !== me);
+  }, [organizationMembers, currentUserId]);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [renameBoardBusy, setRenameBoardBusy] = useState(false);
 
@@ -166,6 +253,11 @@ export default function LeftSidebar({
           logout: "Logout",
           renameHint: "Double-click or menu to rename",
           spacesSection: "Spaces",
+          organizationsSection: "Organization",
+          writeMessage: "Write message",
+          renameOrganization: "Rename organization",
+          renameOrganizationTitle: "Organization name",
+          organizationsPlaceholder: "Name",
           renameSpace: "Rename",
           deleteSpace: "Delete space",
           renameBoard: "Rename board",
@@ -200,6 +292,11 @@ export default function LeftSidebar({
           logout: "Выйти",
           renameHint: "Двойной клик или меню — переименовать",
           spacesSection: "Пространства",
+          organizationsSection: "Организация",
+          writeMessage: "Написать сообщение",
+          renameOrganization: "Переименовать организацию",
+          renameOrganizationTitle: "Название организации",
+          organizationsPlaceholder: "Название",
           renameSpace: "Переименовать",
           deleteSpace: "Удалить пространство",
           renameBoard: "Переименовать доску",
@@ -298,9 +395,17 @@ export default function LeftSidebar({
     handleAddMenuClose();
     if (action === "space") {
       onCreateSpace();
-    } else {
-      onAddAction?.(action);
+      return;
     }
+    if (action === "board") {
+      if (onCreateBoard) {
+        onCreateBoard();
+        return;
+      }
+      onAddAction?.(action);
+      return;
+    }
+    onAddAction?.(action);
   };
 
   return (
@@ -461,6 +566,220 @@ export default function LeftSidebar({
       </Collapse>
 
       <Divider sx={{ my: 0.5, borderColor: BORDER_GRAY }} />
+
+      {/* ===== ОРГАНИЗАЦИИ ===== */}
+      {organizations.length > 0 && onSelectOrganization ? (
+        <>
+          <Box sx={{ px: 1 }}>
+            <ListItemButton
+              onClick={() => setOrgSectionExpanded(!orgSectionExpanded)}
+              sx={{ borderRadius: 1, py: 0.5, "&:hover": { bgcolor: HOVER_BG } }}
+            >
+              <ListItemText
+                primary={t.organizationsSection}
+                primaryTypographyProps={{
+                  fontSize: 11,
+                  fontWeight: 700,
+                  color: TEXT_GRAY,
+                  textTransform: "uppercase",
+                  letterSpacing: "0.5px",
+                }}
+              />
+              {orgSectionExpanded ? (
+                <ExpandLessIcon sx={{ color: TEXT_GRAY, fontSize: 20 }} />
+              ) : (
+                <ExpandMoreIcon sx={{ color: TEXT_GRAY, fontSize: 20 }} />
+              )}
+            </ListItemButton>
+          </Box>
+          <Collapse in={orgSectionExpanded}>
+            <List dense disablePadding sx={{ px: 1, pb: 0.5 }}>
+              {organizations.map((org) => (
+                <Box key={org.id}>
+                  <ListItem
+                    disablePadding
+                    secondaryAction={
+                      org.id === activeOrganizationId &&
+                      canRenameOrganization?.(org.id) &&
+                      onRenameOrganization ? (
+                        <Tooltip title={t.renameOrganization}>
+                          <IconButton
+                            edge="end"
+                            size="small"
+                            aria-label={t.renameOrganization}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setRenameOrgDialog({ id: org.id, name: org.name });
+                              setRenameOrgDraft(org.name);
+                            }}
+                            sx={{ mr: 0.5 }}
+                          >
+                            <EditOutlinedIcon sx={{ fontSize: 18, color: TEXT_GRAY }} />
+                          </IconButton>
+                        </Tooltip>
+                      ) : undefined
+                    }
+                    sx={{
+                      "& .MuiListItemSecondaryAction-root": { right: 4 },
+                      pr: org.id === activeOrganizationId && canRenameOrganization?.(org.id) ? 4 : 0,
+                    }}
+                  >
+                    <ListItemButton
+                      selected={org.id === activeOrganizationId}
+                      onClick={() => onSelectOrganization(org.id)}
+                      sx={{
+                        borderRadius: 1,
+                        py: 0.5,
+                        pr: 1,
+                        "&.Mui-selected": { bgcolor: SELECTED_BG },
+                        "&:hover": { bgcolor: HOVER_BG },
+                      }}
+                    >
+                      <ListItemIcon sx={{ minWidth: 32 }}>
+                        <BusinessIcon sx={{ color: TEXT_GRAY, fontSize: 18 }} />
+                      </ListItemIcon>
+                      <ListItemText
+                        primary={org.name}
+                        primaryTypographyProps={{ fontSize: 13, color: TEXT_DARK, noWrap: true }}
+                      />
+                    </ListItemButton>
+                  </ListItem>
+                  {org.id === activeOrganizationId && (
+                    <Box
+                      sx={{
+                        ml: 1.25,
+                        pl: 1.25,
+                        borderLeft: `2px solid ${BORDER_GRAY}`,
+                        mb: 0.5,
+                        pr: 0.5,
+                      }}
+                    >
+                      {organizationMembersLoading ? (
+                        <Box sx={{ display: "flex", alignItems: "center", gap: 1, py: 1 }}>
+                          <CircularProgress size={16} sx={{ color: ACCENT_PURPLE }} />
+                        </Box>
+                      ) : (
+                        <List dense disablePadding sx={{ maxHeight: 240, overflow: "auto", py: 0.25 }}>
+                          {organizationMembersOthers.map((m) => {
+                            const label = memberDisplayName(m.full_name, m.email);
+                            const roleLabel = formatMemberRole(m.role, language);
+                            const src = resolveMemberAvatarSrc(m.avatar_url);
+                            return (
+                              <ListItem
+                                key={m.id}
+                                dense
+                                alignItems="flex-start"
+                                secondaryAction={
+                                  onOpenDirectMessage ? (
+                                    <Tooltip title={t.writeMessage}>
+                                      <IconButton
+                                        edge="end"
+                                        size="small"
+                                        aria-label={t.writeMessage}
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          onOpenDirectMessage(m);
+                                        }}
+                                        sx={{ mt: 0.25, mr: 0.25, color: TEXT_GRAY }}
+                                      >
+                                        <MailOutlineIcon sx={{ fontSize: 18 }} />
+                                      </IconButton>
+                                    </Tooltip>
+                                  ) : undefined
+                                }
+                                sx={{
+                                  py: 0.35,
+                                  pr: onOpenDirectMessage ? 4.5 : 0.5,
+                                  "& .MuiListItemSecondaryAction-root": { right: 0 },
+                                }}
+                              >
+                                <ListItemAvatar sx={{ minWidth: 36, mt: 0.25 }}>
+                                  <Avatar
+                                    src={src}
+                                    alt=""
+                                    sx={{
+                                      width: 28,
+                                      height: 28,
+                                      fontSize: 11,
+                                      fontWeight: 600,
+                                      bgcolor: ACCENT_PURPLE,
+                                    }}
+                                  >
+                                    {memberInitials(m.full_name, m.email)}
+                                  </Avatar>
+                                </ListItemAvatar>
+                                <ListItemText
+                                  primary={label}
+                                  secondary={`(${roleLabel})`}
+                                  primaryTypographyProps={{
+                                    fontSize: 12,
+                                    color: TEXT_DARK,
+                                    sx: { wordBreak: "break-word" },
+                                  }}
+                                  secondaryTypographyProps={{
+                                    fontSize: 11,
+                                    color: TEXT_GRAY,
+                                    lineHeight: 1.2,
+                                  }}
+                                  sx={{ m: 0 }}
+                                />
+                              </ListItem>
+                            );
+                          })}
+                        </List>
+                      )}
+                    </Box>
+                  )}
+                </Box>
+              ))}
+            </List>
+          </Collapse>
+          <Divider sx={{ my: 0.5, borderColor: BORDER_GRAY }} />
+        </>
+      ) : null}
+
+      <Dialog open={Boolean(renameOrgDialog)} onClose={() => !renameOrgBusy && setRenameOrgDialog(null)} maxWidth="xs" fullWidth>
+        <DialogTitle sx={{ fontSize: 16 }}>{t.renameOrganizationTitle}</DialogTitle>
+        <DialogContent>
+          <InputBase
+            autoFocus
+            fullWidth
+            value={renameOrgDraft}
+            onChange={(e) => setRenameOrgDraft(e.target.value)}
+            placeholder={t.organizationsPlaceholder}
+            disabled={renameOrgBusy}
+            sx={{
+              mt: 0.5,
+              px: 1.5,
+              py: 1,
+              borderRadius: 1,
+              border: `1px solid ${BORDER_GRAY}`,
+              fontSize: 14,
+            }}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setRenameOrgDialog(null)} disabled={renameOrgBusy}>
+            {t.cancel}
+          </Button>
+          <Button
+            variant="contained"
+            disabled={renameOrgBusy || !renameOrgDraft.trim()}
+            onClick={async () => {
+              if (!renameOrgDialog || !onRenameOrganization || !renameOrgDraft.trim()) return;
+              setRenameOrgBusy(true);
+              try {
+                const ok = await Promise.resolve(onRenameOrganization(renameOrgDialog.id, renameOrgDraft.trim()));
+                if (ok !== false) setRenameOrgDialog(null);
+              } finally {
+                setRenameOrgBusy(false);
+              }
+            }}
+          >
+            {renameOrgBusy ? "…" : t.renameSpace}
+          </Button>
+        </DialogActions>
+      </Dialog>
 
       {/* ===== ПРОСТРАНСТВА ===== */}
       <Box sx={{ flex: 1, overflow: "auto", minHeight: 0 }}>

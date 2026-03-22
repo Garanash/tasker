@@ -56,8 +56,6 @@ export default function ProfileSettingsDialog({
   const [loading, setLoading] = useState(false);
   const [avatarUploading, setAvatarUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [loginCodeBusy, setLoginCodeBusy] = useState(false);
-  const [loginCodeInfo, setLoginCodeInfo] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const t =
@@ -73,13 +71,6 @@ export default function ProfileSettingsDialog({
           uploadFailed: "Could not upload avatar",
           invalidType: "Use JPEG, PNG, WebP or GIF",
           fileTooLarge: "File is too large (max 5 MB)",
-          requestLoginCode: "Send one-time login code",
-          requestLoginCodeHint:
-            "A 6-digit code will be sent to your email. Use it on the sign-in page under “Sign in with code”.",
-          codeSent: "If mail is configured, check your inbox (code valid 15 min).",
-          codeSending: "Sending…",
-          codeFailed: "Could not send code",
-          mailNotConfigured: "Email is not configured on the server (SMTP).",
         }
       : {
           title: "Настройки профиля",
@@ -92,13 +83,6 @@ export default function ProfileSettingsDialog({
           uploadFailed: "Не удалось загрузить аватар",
           invalidType: "Допустимы JPEG, PNG, WebP или GIF",
           fileTooLarge: "Файл слишком большой (максимум 5 МБ)",
-          requestLoginCode: "Сбросить пароль — код на почту",
-          requestLoginCodeHint:
-            "На email придёт 6-значный код. На экране входа выберите «Вход по коду» и введите его вместо пароля.",
-          codeSent: "Если почта настроена на сервере, проверьте письмо (код действует 15 минут).",
-          codeSending: "Отправка…",
-          codeFailed: "Не удалось отправить код",
-          mailNotConfigured: "На сервере не настроена почта (SMTP).",
         };
 
   useEffect(() => {
@@ -106,7 +90,6 @@ export default function ProfileSettingsDialog({
     setFullName(initialFullName);
     setAvatarUrl(initialAvatarUrl);
     setError(null);
-    setLoginCodeInfo(null);
   }, [open, initialFullName, initialAvatarUrl]);
 
   const avatarSrc = useMemo(() => resolveAvatarDisplayUrl(avatarUrl), [avatarUrl]);
@@ -249,56 +232,8 @@ export default function ProfileSettingsDialog({
     }
   };
 
-  const postRequestLoginCode = (accessToken: string) =>
-    fetch(getApiUrl("/api/auth/me/request-login-code"), {
-      method: "POST",
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
-
-  const handleRequestLoginCode = async () => {
-    setLoginCodeBusy(true);
-    setError(null);
-    setLoginCodeInfo(null);
-    try {
-      let res = await postRequestLoginCode(token);
-      let data: any = await res.json().catch(() => ({}));
-      if (!res.ok && res.status === 401 && data?.detail === "invalid_token") {
-        if (!refreshToken) {
-          onAuthExpired?.();
-          throw new Error(language === "en" ? "Session expired. Sign in again." : "Сессия истекла. Войдите заново.");
-        }
-        const refreshRes = await fetch(getApiUrl("/api/auth/refresh"), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ refresh: refreshToken }),
-        });
-        const refreshData: any = await refreshRes.json().catch(() => ({}));
-        if (!refreshRes.ok || !refreshData?.access) {
-          onAuthExpired?.();
-          throw new Error(language === "en" ? "Session expired. Sign in again." : "Сессия истекла. Войдите заново.");
-        }
-        onTokensUpdated?.({ access: refreshData.access, refresh: refreshData.refresh });
-        res = await postRequestLoginCode(refreshData.access);
-        data = await res.json().catch(() => ({}));
-      }
-      if (!res.ok) {
-        if (data?.detail === "mail_not_configured") {
-          setError(t.mailNotConfigured);
-          return;
-        }
-        throw new Error(typeof data?.detail === "string" ? data.detail : t.codeFailed);
-      }
-      setLoginCodeInfo(t.codeSent);
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setLoginCodeBusy(false);
-    }
-  };
-
   const previewLetter = (fullName.trim() || "?").charAt(0).toUpperCase();
   const busy = loading || avatarUploading;
-  const codeSectionBusy = loginCodeBusy;
 
   return (
     <Dialog
@@ -407,30 +342,6 @@ export default function ProfileSettingsDialog({
           </Typography>
         </Box>
         <TextField label={t.name} value={fullName} onChange={(e) => setFullName(e.target.value)} fullWidth autoFocus disabled={busy} />
-        <Box sx={{ borderTop: "1px solid var(--k-border)", pt: 2, mt: 0.5 }}>
-          <Typography variant="body2" sx={{ color: "var(--k-text-muted)", mb: 1.5 }}>
-            {t.requestLoginCodeHint}
-          </Typography>
-          <Button
-            variant="outlined"
-            onClick={() => void handleRequestLoginCode()}
-            disabled={busy || codeSectionBusy}
-            sx={{
-              borderRadius: 999,
-              textTransform: "none",
-              borderColor: "var(--k-border)",
-              color: "var(--k-text)",
-              "&:hover": { borderColor: "#9C27B0", bgcolor: "rgba(156,39,176,0.08)" },
-            }}
-          >
-            {loginCodeBusy ? t.codeSending : t.requestLoginCode}
-          </Button>
-          {loginCodeInfo ? (
-            <Typography variant="body2" sx={{ color: "var(--k-text-muted)", mt: 1.5 }}>
-              {loginCodeInfo}
-            </Typography>
-          ) : null}
-        </Box>
         {error ? (
           <Typography variant="body2" color="error">
             {error}

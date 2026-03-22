@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, memo, useCallback, useMemo, type ReactNode } from "react";
+import { useState, memo, useCallback, useMemo, type ReactNode } from "react";
 import type { CSSProperties } from "react";
 import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { getApiUrl } from "@/lib/api";
@@ -12,20 +12,18 @@ import {
   Typography,
   Chip,
   Tooltip,
+  Avatar,
 } from "@mui/material";
 import MoreHorizIcon from "@mui/icons-material/MoreHoriz";
 import AccessTimeIcon from "@mui/icons-material/AccessTime";
 import ChatBubbleOutlineIcon from "@mui/icons-material/ChatBubbleOutline";
 import AttachFileIcon from "@mui/icons-material/AttachFile";
-import PersonOutlineIcon from "@mui/icons-material/PersonOutline";
 import FlagIcon from "@mui/icons-material/Flag";
 import EditOutlinedIcon from "@mui/icons-material/EditOutlined";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import ArchiveOutlinedIcon from "@mui/icons-material/ArchiveOutlined";
 import OpenInNewIcon from "@mui/icons-material/OpenInNew";
-import PlayArrowIcon from "@mui/icons-material/PlayArrow";
-import StopIcon from "@mui/icons-material/Stop";
 import StarIcon from "@mui/icons-material/Star";
 import LocalFireDepartmentIcon from "@mui/icons-material/LocalFireDepartment";
 import TimerOutlinedIcon from "@mui/icons-material/TimerOutlined";
@@ -51,26 +49,6 @@ type Card = {
   comments_count?: number;
   attachments_count?: number;
 };
-
-type TimeEntry = {
-  id: string;
-  card_id: string;
-  started_at: string;
-  ended_at: string | null;
-  duration_seconds: number;
-  note: string;
-};
-
-let isTimeApiAvailable: boolean | null = null;
-
-function formatSeconds(totalSeconds: number) {
-  const sec = Math.max(0, Math.floor(totalSeconds));
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = sec % 60;
-  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-  return `${m}:${String(s).padStart(2, "0")}`;
-}
 
 /** Убирает остатки JSON/массива: ["тег → тег */
 function sanitizeKanbanTagLabel(tag: string): string {
@@ -182,11 +160,12 @@ type Props = {
   blockedCount?: number;
   blockingCount?: number;
   plannedEndAt?: string | null;
+  currentUserRole?: "executor" | "manager" | "admin";
 };
 
 function KanbanCardComponent({
   card,
-  token,
+  token: _token,
   locale = "ru",
   onOpen,
   onEdit,
@@ -200,9 +179,11 @@ function KanbanCardComponent({
   priority = null,
   tags = [],
   assigneeName = null,
+  assigneeAvatarUrl = null,
   blockedCount = 0,
   blockingCount = 0,
   plannedEndAt = null,
+  currentUserRole,
 }: Props) {
   const draggable = useDraggable({
     id: `card:${card.id}`,
@@ -227,96 +208,7 @@ function KanbanCardComponent({
   };
 
   const [menuAnchor, setMenuAnchor] = useState<null | HTMLElement>(null);
-  const [activeEntry, setActiveEntry] = useState<TimeEntry | null>(null);
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [isHovered, setIsHovered] = useState(false);
-
-  async function fetchActiveEntry() {
-    if (isTimeApiAvailable === false) {
-      setActiveEntry(null);
-      setElapsedSeconds(0);
-      return;
-    }
-    try {
-      const res = await fetch(getApiUrl(`/api/time/entries?card_id=${encodeURIComponent(card.id)}`), {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (res.status === 404) {
-        isTimeApiAvailable = false;
-        setActiveEntry(null);
-        setElapsedSeconds(0);
-        return;
-      }
-      if (!res.ok) return;
-      isTimeApiAvailable = true;
-      const data = (await res.json()) as TimeEntry[];
-      const active = data.find((e) => e.ended_at === null) ?? null;
-      setActiveEntry(active);
-      if (active?.started_at) {
-        const startedMs = new Date(active.started_at).getTime();
-        setElapsedSeconds(Math.max(0, (Date.now() - startedMs) / 1000));
-      } else {
-        setElapsedSeconds(0);
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  useEffect(() => {
-    fetchActiveEntry();
-  }, [card.id, token]);
-
-  useEffect(() => {
-    if (!activeEntry) return;
-    const interval = window.setInterval(() => {
-      const startedMs = new Date(activeEntry.started_at).getTime();
-      setElapsedSeconds(Math.max(0, (Date.now() - startedMs) / 1000));
-    }, 1000);
-    return () => window.clearInterval(interval);
-  }, [activeEntry]);
-
-  async function startTimer(e: React.MouseEvent) {
-    e.stopPropagation();
-    if (isTimeApiAvailable === false) return;
-    try {
-      const res = await fetch(getApiUrl("/api/time/entries/start"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ card_id: card.id, note: "" }),
-      });
-      if (res.status === 404) {
-        isTimeApiAvailable = false;
-        return;
-      }
-      if (!res.ok) return;
-      isTimeApiAvailable = true;
-      await fetchActiveEntry();
-    } catch {
-      // ignore
-    }
-  }
-
-  async function stopTimer(e: React.MouseEvent) {
-    e.stopPropagation();
-    if (isTimeApiAvailable === false) return;
-    try {
-      const res = await fetch(getApiUrl("/api/time/entries/stop"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ card_id: card.id }),
-      });
-      if (res.status === 404) {
-        isTimeApiAvailable = false;
-        return;
-      }
-      if (!res.ok) return;
-      isTimeApiAvailable = true;
-      await fetchActiveEntry();
-    } catch {
-      // ignore
-    }
-  }
 
   const handleMenuOpen = (e: React.MouseEvent<HTMLButtonElement>) => {
     e.stopPropagation();
@@ -378,6 +270,12 @@ function KanbanCardComponent({
     return raw.replace(/^["']+/, "").replace(/["']+$/, "");
   }, [assigneeName]);
   const assigneeInitial = assigneeDisplayName ? assigneeDisplayName.charAt(0).toUpperCase() : "?";
+  const assigneeAvatarSrc = useMemo(() => {
+    const u = (assigneeAvatarUrl || "").trim();
+    if (!u) return undefined;
+    if (u.startsWith("http://") || u.startsWith("https://")) return u;
+    return getApiUrl(u.startsWith("/") ? u : `/${u}`);
+  }, [assigneeAvatarUrl]);
 
   return (
     <Box
@@ -638,8 +536,27 @@ function KanbanCardComponent({
           <Tooltip title={locale === "en" ? "Comments" : "Комментарии"}>
             <Box sx={{ display: "flex", alignItems: "center", gap: 0.25, color: "var(--k-text-muted)", position: "relative" }}>
               <ChatBubbleOutlineIcon sx={{ fontSize: 14 }} />
-              <Typography sx={{ fontSize: 11 }}>{commentsCount}</Typography>
-              {unreadCommentsCount > 0 ? (
+              <Typography
+                sx={{
+                  fontSize: 11,
+                  ...(currentUserRole === "executor" && unreadCommentsCount > 0
+                    ? {
+                        minWidth: 18,
+                        height: 18,
+                        px: 0.5,
+                        borderRadius: "999px",
+                        border: "1px solid #ef4444",
+                        color: "#ef4444",
+                        fontWeight: 700,
+                        lineHeight: "16px",
+                        textAlign: "center",
+                      }
+                    : {}),
+                }}
+              >
+                {commentsCount}
+              </Typography>
+              {unreadCommentsCount > 0 && currentUserRole !== "executor" ? (
                 <Box
                   sx={{
                     minWidth: 16,
@@ -670,53 +587,6 @@ function KanbanCardComponent({
             </Box>
           </Tooltip>
         )}
-
-        <Box sx={{ flex: 1 }} />
-
-        {/* Таймер */}
-        <Tooltip title={activeEntry ? (locale === "en" ? "Stop timer" : "Остановить таймер") : (locale === "en" ? "Start timer" : "Запустить таймер")}>
-          <Box
-            onClick={activeEntry ? stopTimer : startTimer}
-            sx={{
-              display: "flex",
-              alignItems: "center",
-              gap: 0.5,
-              px: 0.75,
-              py: 0.25,
-              borderRadius: 1,
-              cursor: "pointer",
-              bgcolor: activeEntry ? "#E8F5E9" : "transparent",
-              color: activeEntry ? "#2E7D32" : "var(--k-text-muted)",
-              "&:hover": { bgcolor: activeEntry ? "#C8E6C9" : "var(--k-text)" },
-            }}
-          >
-            {activeEntry ? (
-              <>
-                <StopIcon sx={{ fontSize: 14 }} />
-                <Typography sx={{ fontSize: 11, fontWeight: 500 }}>
-                  {formatSeconds(elapsedSeconds)}
-                </Typography>
-              </>
-            ) : (
-              <PlayArrowIcon sx={{ fontSize: 14 }} />
-            )}
-          </Box>
-        </Tooltip>
-
-        {/* Аватар исполнителя */}
-        <Box
-          sx={{
-            width: 22,
-            height: 22,
-            borderRadius: "50%",
-            bgcolor: "var(--k-text)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-          }}
-        >
-          <PersonOutlineIcon sx={{ fontSize: 14, color: "var(--k-text-muted)" }} />
-        </Box>
       </Box>
       {(blockingCount > 0 || blockedCount > 0 || assigneeDisplayName) && (
         <Box sx={{ mt: 1, display: "flex", flexDirection: "column", gap: 0.5 }}>
@@ -764,23 +634,20 @@ function KanbanCardComponent({
                 maxWidth: "100%",
               }}
             >
-              <Box
+              <Avatar
+                src={assigneeAvatarSrc}
                 sx={{
                   width: 18,
                   height: 18,
-                  borderRadius: "50%",
-                  background: "linear-gradient(90deg, #8A2BE2, #4B0082)",
-                  color: "#fff",
                   fontSize: 10,
                   fontWeight: 700,
-                  display: "inline-flex",
-                  alignItems: "center",
-                  justifyContent: "center",
                   flexShrink: 0,
+                  background: "linear-gradient(90deg, #8A2BE2, #4B0082)",
+                  color: "#fff",
                 }}
               >
                 {assigneeInitial}
-              </Box>
+              </Avatar>
               <Box sx={{ fontSize: 11, color: "var(--k-text-muted)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                 {assigneeDisplayName}
               </Box>

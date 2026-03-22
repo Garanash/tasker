@@ -1,5 +1,6 @@
 "use client";
 
+import { useMemo } from "react";
 import {
   Box,
   Menu,
@@ -8,6 +9,7 @@ import {
   Divider,
   Avatar,
 } from "@mui/material";
+import { getApiUrl } from "@/lib/api";
 import SettingsOutlinedIcon from "@mui/icons-material/SettingsOutlined";
 import LogoutIcon from "@mui/icons-material/Logout";
 
@@ -18,6 +20,13 @@ const K_SURFACE = "var(--k-surface-bg, #FFFFFF)";
 const K_BORDER = "var(--k-border, #E0E0E0)";
 const K_HOVER = "var(--k-hover, rgba(0,0,0,0.04))";
 const ACCENT_PURPLE = "#9C27B0";
+
+function resolveProfileAvatarSrc(avatarUrl: string | undefined): string | undefined {
+  const u = (avatarUrl || "").trim();
+  if (!u) return undefined;
+  if (u.startsWith("http://") || u.startsWith("https://")) return u;
+  return getApiUrl(u.startsWith("/") ? u : `/${u}`);
+}
 
 export type ColorTheme = "light" | "dark" | "system";
 export type ProfileLanguage = "ru" | "en";
@@ -55,6 +64,8 @@ export default function ProfileMenu({
   onLogout,
   appVersion = "1.0.0",
 }: Props) {
+  const avatarSrc = useMemo(() => resolveProfileAvatarSrc(avatarUrl), [avatarUrl]);
+
   const t =
     language === "en"
       ? {
@@ -106,7 +117,7 @@ export default function ProfileMenu({
       <Box sx={{ px: 2, py: 2 }}>
         <Box sx={{ display: "flex", alignItems: "center", gap: 1.5 }}>
           <Avatar
-            src={avatarUrl}
+            src={avatarSrc}
             sx={{
               width: 48,
               height: 48,

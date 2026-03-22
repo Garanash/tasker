@@ -1,5 +1,5 @@
 """
-Нативный Kanban API: boards, bootstrap, grid, card, move, comments, attachments.
+Kanban API приложения AGBTasker: доски, колонки, дорожки, карточки, вложения и комментарии.
 """
 from __future__ import annotations
 
@@ -19,11 +19,11 @@ from .deps import (
     ROLE_PRIORITY,
     get_effective_role,
     require_authenticated_user_id,
-    require_lead_role,
     require_manager_role,
     require_space_access,
 )
 from .notifications import create_notification_for_org_members, ensure_notifications_table
+from .auth import _ensure_user_avatar_url_column
 from . import state
 
 router = APIRouter(prefix="/api/kanban", tags=["kanban"])
@@ -173,9 +173,9 @@ async def _can_executor_work_with_card(conn: asyncpg.Connection, user_id: str, c
     return bool(assignee)
 
 
-async def _require_lead_for_space_org(space_id: str, user_id: str) -> tuple[str, str]:
+async def _require_manager_for_space_org(space_id: str, user_id: str) -> tuple[str, str]:
     """
-    Доступ к операции с пространством: членство в org пространства + роль lead+ (с учётом групп).
+    Доступ к операции с пространством: членство в org пространства + роль менеджера или администратора.
     Не зависит от X-Space-Id (важно при нескольких организациях).
     """
     if not state.pg_pool:
@@ -195,7 +195,7 @@ async def _require_lead_for_space_org(space_id: str, user_id: str) -> tuple[str,
         raise HTTPException(status_code=404, detail="Пространство не найдено или нет доступа")
     org_id = str(row["organization_id"])
     role = await get_effective_role(user_id, org_id)
-    if ROLE_PRIORITY.get(role, 0) < ROLE_PRIORITY["lead"]:
+    if ROLE_PRIORITY.get(role, 0) < ROLE_PRIORITY["manager"]:
         raise HTTPException(status_code=403, detail="insufficient_role")
     return str(row["id"]), org_id
 
@@ -231,10 +231,29 @@ async def _require_manager_for_board(board_id: str, user_id: str) -> tuple[str, 
 MEDIA_URL = os.environ.get("MEDIA_URL", "/media/")
 
 
+def _delete_local_attachment_file(file_url: str) -> None:
+    """Удаляет файл на диске, если URL указывает на загруженное вложение под MEDIA_ROOT."""
+    if not file_url or "/attachments/" not in file_url:
+        return
+    tail = file_url.split("/attachments/", 1)[1]
+    if not tail or ".." in tail.replace("\\", "/"):
+        return
+    path = Path(MEDIA_ROOT) / "attachments" / tail
+    try:
+        root = Path(MEDIA_ROOT).resolve()
+        resolved = path.resolve()
+        if not str(resolved).startswith(str(root)):
+            return
+        if resolved.is_file():
+            resolved.unlink()
+    except OSError:
+        pass
+
+
 async def _purge_card_dependencies(conn: asyncpg.Connection, card_id: str) -> None:
     """
     Удаляет строки, зависящие от карточки, до DELETE FROM core_card.
-    В схемах без ON DELETE CASCADE (часто в миграциях Django) иначе будет ForeignKeyViolation.
+    В схемах без ON DELETE CASCADE (старые миграции БД) иначе будет ForeignKeyViolation.
     """
     await conn.execute("UPDATE core_card SET parent_id = NULL WHERE parent_id = $1::uuid", card_id)
     await conn.execute(
@@ -446,30 +465,14 @@ def _card_lite(row: Any, meta: dict[str, Any] | None = None) -> dict[str, Any]:
         "tags": _coerce_tags_list(meta.get("tags")),
         "assignee_name": meta.get("assignee_name"),
         "assignee_user_id": meta.get("assignee_user_id"),
+        "assignee_avatar_url": meta.get("assignee_avatar_url"),
         "blocked_count": int(meta.get("blocked_count") or 0),
         "blocking_count": int(meta.get("blocking_count") or 0),
         "comments_count": int(meta.get("comments_count") or 0),
         "unread_comments_count": int(meta.get("unread_comments_count") or 0),
         "attachments_count": int(meta.get("attachments_count") or 0),
+        "estimate_points": int(row["estimate_points"]) if row.get("estimate_points") is not None else None,
     }
-
-
-async def _check_board_space_access(conn, board_id: str, user_id: str, space_id: str | None) -> bool:
-    if not space_id:
-        return True
-    r = await conn.fetchrow(
-        """
-        SELECT 1 FROM core_board b
-        JOIN core_space s ON s.id = b.space_id
-        JOIN core_organizationmember om ON om.organization_id = s.organization_id
-        WHERE b.id = $1::uuid AND om.user_id = $2::uuid AND s.id = $3::uuid
-        LIMIT 1
-        """,
-        board_id,
-        user_id,
-        space_id,
-    )
-    return bool(r)
 
 
 @router.get("/boards")
@@ -477,7 +480,11 @@ async def boards_list(
     request: Request,
     user_id: str = Depends(require_authenticated_user_id),
 ) -> list[dict[str, Any]]:
-    """Список досок по организациям пользователя; при наличии X-Space-Id — только по space."""
+    """Список досок, доступных текущему пользователю.
+
+    Заголовок `Authorization: Bearer` обязателен. Если передан `X-Space-Id`, возвращаются только доски этого пространства;
+    иначе — все доски по всем организациям пользователя. Ответ: массив объектов с полями id, name, space_id, project_id.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     space_id = request.headers.get("x-space-id")
@@ -518,7 +525,10 @@ async def projects_list(
     request: Request,
     user_id: str = Depends(require_authenticated_user_id),
 ) -> list[dict[str, Any]]:
-    """Список папок/проектов по организациям пользователя; при X-Space-Id — только по space."""
+    """Список проектов (папок) в доступных пространствах.
+
+    С `X-Space-Id` — только проекты выбранного space. Иначе — по всем space пользователя. Поля: id, name, space_id.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     space_id = request.headers.get("x-space-id")
@@ -557,7 +567,10 @@ async def create_project(
     user_id: str = Depends(require_authenticated_user_id),
     _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
-    """Создать папку/проект в доступном пользователю пространстве."""
+    """Создать проект в пространстве.
+
+    Тело: `name`, `space_id` (или берётся из `X-Space-Id`). Требуется роль manager или выше. Ответ: id, name, space_id.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -601,7 +614,10 @@ async def create_board(
     user_id: str = Depends(require_authenticated_user_id),
     _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
-    """Создать доску в доступном пользователю пространстве."""
+    """Создать канбан-доску.
+
+    Тело: `name`, `space_id` / заголовок space, опционально `project_id`. Роль manager+. Возвращает id и метаданные доски.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -680,7 +696,10 @@ async def rename_board(
     board_id: str,
     user_id: str = Depends(require_authenticated_user_id),
 ) -> dict[str, Any]:
-    """Переименовать доску."""
+    """Переименовать доску по `board_id`.
+
+    PATCH: `{\"name\": \"...\"}`. Проверяется членство и `X-Space-Id`. Роль manager+.
+    """
     await _require_manager_for_board(board_id, user_id)
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
@@ -698,7 +717,10 @@ async def delete_board(
     board_id: str,
     user_id: str = Depends(require_authenticated_user_id),
 ) -> dict[str, Any]:
-    """Удалить доску и все её данные."""
+    """Удалить доску и связанные сущности (колонки, карточки — согласно каскадам БД).
+
+    Роль менеджера/админа в зависимости от политики. Требуется доступ к space доски.
+    """
     await _require_manager_for_board(board_id, user_id)
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
@@ -717,7 +739,10 @@ async def create_column(
     _: None = Depends(require_space_access),
     _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
-    """Добавить колонку в доску."""
+    """Добавить колонку на доску.
+
+    Тело: `name`, опционально `order_index`, `is_done`. Роль manager+. Используется для кастомизации воронки.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -774,7 +799,10 @@ async def create_track(
     _: None = Depends(require_space_access),
     _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
-    """Добавить дорожку (строку) на доску."""
+    """Добавить дорожку (swimlane) на доску.
+
+    Тело: `name`. Порядок — в конец списка дорожек. Роль manager+.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -827,6 +855,11 @@ async def rename_track(
     _: None = Depends(require_space_access),
     _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
+    """Переименовать дорожку (swimlane) доски.
+
+    Тело JSON: `{\"name\": \"...\"}`. Требуется `Authorization: Bearer`, заголовок `X-Space-Id`
+    (согласован с дорожкой) и роль manager или выше. Ошибки: 400 (пустое имя), 403 (другой space), 404.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -864,6 +897,11 @@ async def delete_track(
     _: None = Depends(require_space_access),
     _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
+    """Удалить дорожку доски.
+
+    Карточки на дорожке получают `track_id = null`. Требуется Bearer, `X-Space-Id`, роль manager+.
+    Ответ: `{\"ok\": true, \"id\": \"...\"}`. Ошибки: 403, 404.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     async with state.pg_pool.acquire() as conn:
@@ -900,7 +938,10 @@ async def update_column(
     _: None = Depends(require_space_access),
     _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
-    """Обновить колонку: имя и/или признак «колонка завершения» (is_done)."""
+    """Обновить колонку: имя и/или признак «колонка завершения» (`is_done`).
+
+    PATCH: хотя бы одно из полей `name`, `is_done`. Роль manager+. Используется для финальных стадий канбана.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -966,6 +1007,64 @@ async def update_column(
     }
 
 
+@router.delete("/columns/{column_id}")
+async def delete_column(
+    request: Request,
+    column_id: str,
+    user_id: str = Depends(require_authenticated_user_id),
+    _: None = Depends(require_space_access),
+    _role: str = Depends(require_manager_role),
+) -> dict[str, Any]:
+    """Удалить колонку доски.
+
+    Ограничения:
+    - нельзя удалить последнюю колонку доски;
+    - нельзя удалить непустую колонку (сначала переместите карточки).
+    """
+    if not state.pg_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    async with state.pg_pool.acquire() as conn:
+        col = await conn.fetchrow(
+            """
+            SELECT c.id, c.board_id, b.space_id
+            FROM core_column c
+            JOIN core_board b ON b.id = c.board_id
+            JOIN core_space s ON s.id = b.space_id
+            JOIN core_organizationmember om ON om.organization_id = s.organization_id
+            WHERE c.id = $1::uuid AND om.user_id = $2::uuid
+            LIMIT 1
+            """,
+            column_id,
+            user_id,
+        )
+        if not col:
+            raise HTTPException(status_code=404, detail="Колонка не найдена")
+
+        space_id = request.headers.get("x-space-id")
+        if space_id and str(col["space_id"]) != space_id:
+            raise HTTPException(status_code=403, detail="space_forbidden")
+
+        board_id = str(col["board_id"])
+        columns_total = await conn.fetchval(
+            "SELECT COUNT(*)::int FROM core_column WHERE board_id = $1::uuid",
+            board_id,
+        )
+        if int(columns_total or 0) <= 1:
+            raise HTTPException(status_code=400, detail="cannot_delete_last_column")
+
+        cards_total = await conn.fetchval(
+            "SELECT COUNT(*)::int FROM core_card WHERE column_id = $1::uuid",
+            column_id,
+        )
+        if int(cards_total or 0) > 0:
+            raise HTTPException(status_code=400, detail="column_not_empty")
+
+        await conn.execute("DELETE FROM core_column WHERE id = $1::uuid", column_id)
+
+    return {"ok": True, "id": column_id}
+
+
 @router.post("/columns/{column_id}/reorder")
 async def reorder_column(
     request: Request,
@@ -974,7 +1073,10 @@ async def reorder_column(
     _: None = Depends(require_space_access),
     _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
-    """Поменять порядок колонки с соседней (left / right)."""
+    """Изменить порядок колонки относительно соседей.
+
+    Тело: `direction` — `left` или `right`. Меняет `order_index` местами с соседней колонкой. Роль manager+.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -1036,7 +1138,10 @@ async def set_column_wip_limit(
     _: None = Depends(require_space_access),
     _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
-    """Задать или снять лимит WIP для колонки (null — удалить лимит)."""
+    """Задать или снять лимит WIP для колонки.
+
+    PATCH: `limit` — целое число или `null` (удалить лимит). Применяется к колонке доски; при переполнении `move` вернёт ошибку.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -1122,7 +1227,10 @@ async def bootstrap(
     user_id: str = Depends(require_authenticated_user_id),
     _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
-    """Создать демо-доску: проект, доска, 3 колонки, 2 карточки, track, WIP, чеклист, поля."""
+    """Инициализировать пространство демо-данными (проект, доска, колонки workflow, карточки, дорожка, WIP, чеклист, поля).
+
+    Вызывается при первом входе в пустое пространство. Идемпотентность не гарантируется при повторных вызовах — создаёт новые сущности.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     space_id = request.headers.get("x-space-id")
@@ -1217,11 +1325,17 @@ async def bootstrap(
 
 @router.get("/boards/{board_id}/grid")
 async def board_grid(
-    request: Request,
     board_id: str,
     user_id: str = Depends(require_authenticated_user_id),
-    _: None = Depends(require_space_access),
 ) -> dict[str, Any]:
+    """Получить полное состояние канбан-доски для UI.
+
+    Возвращает объект `board`, список `columns` (с карточками внутри), `tracks`, `effective_role`.
+    Гарантирует наличие стандартного workflow колонок.
+    Доступ: членство в организации доски (`get_effective_role`). Заголовок `X-Space-Id` намеренно
+    не проверяется здесь: устаревший или «чужой» space из UI иначе давал 403 при загрузке сетки.
+    Включает метаданные карточек: поля, счётчики комментариев/вложений, WIP-лимиты колонок.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     async with state.pg_pool.acquire() as conn:
@@ -1231,9 +1345,6 @@ async def board_grid(
         )
         if not board:
             raise HTTPException(status_code=404, detail="Доска не найдена")
-        space_id = request.headers.get("x-space-id")
-        if space_id and not await _check_board_space_access(conn, board_id, user_id, space_id):
-            raise HTTPException(status_code=403, detail="space_forbidden")
         await _ensure_board_workflow(conn, board_id)
         org_id = await conn.fetchval(
             "SELECT s.organization_id FROM core_board b JOIN core_space s ON s.id = b.space_id WHERE b.id = $1::uuid",
@@ -1253,7 +1364,7 @@ async def board_grid(
             board_id,
         )
         cards = await conn.fetch(
-            "SELECT id, title, description, card_type, due_at, planned_start_at, planned_end_at, track_id, column_id FROM core_card WHERE board_id = $1::uuid ORDER BY updated_at DESC",
+            "SELECT id, title, description, card_type, due_at, planned_start_at, planned_end_at, track_id, column_id, estimate_points FROM core_card WHERE board_id = $1::uuid ORDER BY updated_at DESC",
             board_id,
         )
         tracks = await conn.fetch(
@@ -1330,6 +1441,30 @@ async def board_grid(
                 meta = card_meta.setdefault(cid, {})
                 meta["attachments_count"] = int(row["attachments_count"] or 0)
 
+            assignee_ids: list[str] = []
+            for meta in card_meta.values():
+                aid = meta.get("assignee_user_id")
+                if aid and str(aid).strip():
+                    assignee_ids.append(str(aid).strip())
+            if assignee_ids:
+                unique_assignees = list({x for x in assignee_ids})
+                await _ensure_user_avatar_url_column(conn)
+                avatar_rows = await conn.fetch(
+                    """
+                    SELECT id::text AS id, COALESCE(NULLIF(trim(avatar_url), ''), '') AS avatar_url
+                    FROM core_user WHERE id = ANY($1::uuid[])
+                    """,
+                    unique_assignees,
+                )
+                id_to_avatar = {str(r["id"]): (r["avatar_url"] or "").strip() for r in avatar_rows}
+                for meta in card_meta.values():
+                    aid = meta.get("assignee_user_id")
+                    if not aid:
+                        continue
+                    au = id_to_avatar.get(str(aid).strip())
+                    if au:
+                        meta["assignee_avatar_url"] = au
+
     by_col = {str(c["id"]): [] for c in columns}
     for card in cards:
         cid = str(card["id"])
@@ -1385,6 +1520,11 @@ async def card_move(
     user_id: str = Depends(require_authenticated_user_id),
     _: None = Depends(require_space_access),
 ) -> dict[str, Any]:
+    """Переместить карточку в другую колонку и/или дорожку.
+
+    Тело JSON: `to_column_id` (обязательно), опционально `to_track_id`. Проверяется WIP-лимит целевой колонки,
+    права исполнителя/менеджера. Может обновлять порядок в колонке. Ошибки: 400, 403, 404, 409 (WIP).
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -1479,6 +1619,78 @@ async def card_move(
     return {"ok": True, "movement_id": movement_id, "payload": payload}
 
 
+async def _column_dwell_times_for_card(conn: Any, card_id: str) -> list[dict[str, Any]]:
+    """Суммарное время нахождения карточки в каждой колонке по событиям перемещения."""
+    card = await conn.fetchrow(
+        "SELECT created_at, column_id, board_id FROM core_card WHERE id = $1::uuid",
+        card_id,
+    )
+    if not card:
+        return []
+    created = card["created_at"]
+    if created is not None and getattr(created, "tzinfo", None) is None:
+        created = created.replace(tzinfo=timezone.utc)
+    board_id = str(card["board_id"])
+    rows = await conn.fetch(
+        """
+        SELECT from_column_id, to_column_id, happened_at
+        FROM core_cardmovementevent
+        WHERE card_id = $1::uuid AND event_type = 'moved'
+        ORDER BY happened_at ASC
+        """,
+        card_id,
+    )
+    now = datetime.now(timezone.utc)
+    acc: dict[str, float] = {}
+
+    def _norm_dt(dt: Any) -> datetime | None:
+        if dt is None:
+            return None
+        if getattr(dt, "tzinfo", None) is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    def add_seg(col_id: Any, t0: Any, t1: Any) -> None:
+        if col_id is None or t0 is None or t1 is None:
+            return
+        t0n = _norm_dt(t0)
+        t1n = _norm_dt(t1)
+        if t0n is None or t1n is None or t1n <= t0n:
+            return
+        cid = str(col_id)
+        acc[cid] = acc.get(cid, 0.0) + (t1n - t0n).total_seconds()
+
+    if not rows:
+        add_seg(card["column_id"], created, now)
+    else:
+        add_seg(rows[0]["from_column_id"], created, rows[0]["happened_at"])
+        for i in range(len(rows) - 1):
+            add_seg(rows[i]["to_column_id"], rows[i]["happened_at"], rows[i + 1]["happened_at"])
+        add_seg(rows[-1]["to_column_id"], rows[-1]["happened_at"], now)
+
+    if not acc:
+        return []
+
+    col_ids = list(acc.keys())
+    name_rows = await conn.fetch(
+        "SELECT id, name, order_index FROM core_column WHERE board_id = $1::uuid AND id = ANY($2::uuid[])",
+        board_id,
+        col_ids,
+    )
+    names = {str(r["id"]): (r["name"] or "") for r in name_rows}
+    order_map = {str(r["id"]): int(r["order_index"]) for r in name_rows}
+    out = [
+        {
+            "column_id": cid,
+            "column_name": names.get(cid, ""),
+            "seconds": round(acc[cid], 1),
+        }
+        for cid in col_ids
+    ]
+    out.sort(key=lambda x: (order_map.get(x["column_id"], 999), x["column_name"]))
+    return out
+
+
 async def _card_detail_dict(conn, card_id: str) -> dict[str, Any]:
     """Собрать полный ответ карточки по card_id (требует открытый conn)."""
     card = await conn.fetchrow(
@@ -1543,6 +1755,7 @@ async def _card_detail_dict(conn, card_id: str) -> dict[str, Any]:
         "attachments": [{"id": str(a["id"]), "file_name": a["file_name"], "file_url": a["file_url"], "content_type": a["content_type"] or "", "size_bytes": a["size_bytes"], "created_at": a["created_at"].isoformat() if a.get("created_at") else None} for a in attachments],
         "field_values": [{"id": str(f["id"]), "definition_id": str(f["definition_id"]), "key": f["key"], "name": f["name"], "value": val(f["value"]), "updated_at": f["updated_at"].isoformat() if f.get("updated_at") else None} for f in field_values],
         "comments": [{"id": str(c["id"]), "author_id": str(c["author_id"]), "author_full_name": c["full_name"] or "", "author_email": c["email"], "body": c["body"], "created_at": c["created_at"].isoformat() if c.get("created_at") else None} for c in comments],
+        "column_dwell_times": await _column_dwell_times_for_card(conn, card_id),
     }
 
 
@@ -1553,12 +1766,21 @@ async def card_detail(
     user_id: str = Depends(require_authenticated_user_id),
     _: None = Depends(require_space_access),
 ) -> dict[str, Any]:
+    """Полная карточка для модального окна: поля, чеклисты, вложения, комментарии, мета.
+
+    Требуется Bearer и `X-Space-Id`, совпадающий с пространством карточки. В ответе — `unread_comments_count`,
+    `column_dwell_times` (только для ролей manager и admin), связи с доской/пространством. Ошибки: 403, 404, 503.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     async with state.pg_pool.acquire() as conn:
         await _ensure_kanban_extensions(conn)
         card = await conn.fetchrow(
-            "SELECT c.id, b.space_id FROM core_card c JOIN core_board b ON b.id = c.board_id WHERE c.id = $1::uuid",
+            """SELECT c.id, b.space_id, s.organization_id
+               FROM core_card c
+               JOIN core_board b ON b.id = c.board_id
+               JOIN core_space s ON s.id = b.space_id
+               WHERE c.id = $1::uuid""",
             card_id,
         )
         if not card:
@@ -1567,6 +1789,9 @@ async def card_detail(
         if space_id and str(card["space_id"]) != space_id:
             raise HTTPException(status_code=403, detail="Карточка вне активного space")
         out = await _card_detail_dict(conn, card_id)
+        role = await get_effective_role(user_id, str(card["organization_id"]))
+        if role not in ("manager", "admin") and out is not None:
+            out.pop("column_dwell_times", None)
         unread_count = await conn.fetchval(
             """
             SELECT COUNT(*)::int
@@ -1592,6 +1817,10 @@ async def create_checklist(
     _: None = Depends(require_space_access),
     _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
+    """Создать чеклист на карточке.
+
+    Тело: `{\"title\": \"...\"}`. Роль manager+. Возвращает id чеклиста и пустой список items.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -1627,6 +1856,10 @@ async def create_checklist_item(
     _: None = Depends(require_space_access),
     _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
+    """Добавить пункт в чеклист.
+
+    Тело: `{\"title\": \"...\"}`. Проверяется принадлежность чеклиста к карточке в текущем space.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -1669,6 +1902,10 @@ async def update_checklist_item(
     _: None = Depends(require_space_access),
     _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
+    """Обновить пункт чеклиста (текст и/или `is_done`).
+
+    PATCH JSON: опционально `title`, `is_done`. Роль manager+.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -1711,6 +1948,11 @@ async def card_comments(
     user_id: str = Depends(require_authenticated_user_id),
     _: None = Depends(require_space_access),
 ) -> list[dict[str, Any]]:
+    """Добавить комментарий к карточке и вернуть полный список комментариев.
+
+    Тело: `body` (текст, до 5000 символов), опционально `attachment_ids` для привязки уже загруженных вложений.
+    Исполнитель может комментировать только «свои» карточки по правилам ACL. Создаёт уведомления участникам орг.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -1811,6 +2053,10 @@ async def mark_card_comments_read(
     user_id: str = Depends(require_authenticated_user_id),
     _: None = Depends(require_space_access),
 ) -> dict[str, Any]:
+    """Отметить все комментарии карточки прочитанными для текущего пользователя.
+
+    Обновляет `core_cardcommentreadstate`. Используется UI после просмотра треда.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     async with state.pg_pool.acquire() as conn:
@@ -1852,6 +2098,10 @@ async def card_attachments(
     user_id: str = Depends(require_authenticated_user_id),
     _: None = Depends(require_space_access),
 ) -> dict[str, Any]:
+    """Добавить вложение: загрузка файла (multipart, поле `file`) или ссылка (JSON: `file_url`, опционально `comment_id`).
+
+    Файлы сохраняются под `MEDIA_ROOT`. Ответ — актуальный объект карточки (`_card_detail_dict`) с `last_attachment`.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     request_content_type = request.headers.get("content-type") or ""
@@ -1948,6 +2198,49 @@ async def card_attachments(
     return detail
 
 
+@router.delete("/cards/{card_id}/attachments/{attachment_id}")
+async def delete_card_attachment(
+    request: Request,
+    card_id: str,
+    attachment_id: str,
+    user_id: str = Depends(require_authenticated_user_id),
+    _: None = Depends(require_space_access),
+) -> dict[str, bool]:
+    """Удалить вложение карточки. Доступно только ролям **manager** и **admin** (не исполнителю)."""
+    if not state.pg_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    async with state.pg_pool.acquire() as conn:
+        await _ensure_kanban_extensions(conn)
+        card = await conn.fetchrow(
+            """SELECT c.id, b.space_id, s.organization_id
+               FROM core_card c
+               JOIN core_board b ON b.id = c.board_id
+               JOIN core_space s ON s.id = b.space_id
+               WHERE c.id = $1::uuid""",
+            card_id,
+        )
+        if not card:
+            raise HTTPException(status_code=404, detail="Карточка не найдена")
+        space_id = request.headers.get("x-space-id")
+        if space_id and str(card["space_id"]) != space_id:
+            raise HTTPException(status_code=403, detail="Карточка вне активного space")
+        role = await get_effective_role(user_id, str(card["organization_id"]))
+        if role not in ("manager", "admin"):
+            raise HTTPException(status_code=403, detail="insufficient_role")
+        row = await conn.fetchrow(
+            "SELECT id, file_url FROM core_attachment WHERE id = $1::uuid AND card_id = $2::uuid",
+            attachment_id,
+            card_id,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Вложение не найдено")
+        file_url = str(row["file_url"] or "")
+        await conn.execute("DELETE FROM core_commentattachmentlink WHERE attachment_id = $1::uuid", attachment_id)
+        await conn.execute("DELETE FROM core_attachment WHERE id = $1::uuid AND card_id = $2::uuid", attachment_id, card_id)
+    _delete_local_attachment_file(file_url)
+    return {"ok": True}
+
+
 @router.patch("/cards/{card_id}")
 async def update_card(
     request: Request,
@@ -1956,6 +2249,10 @@ async def update_card(
     _: None = Depends(require_space_access),
     _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
+    """Частично обновить карточку: заголовок, описание, сроки, колонку, тип (`task`/`bug`/`feature`), оценку.
+
+    PATCH JSON — только передаваемые поля. Исполнитель ограничен (нельзя переносить в бэклог и т.д.). Возвращает полный detail.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -2075,6 +2372,11 @@ async def upsert_card_field_value(
     _: None = Depends(require_space_access),
     _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
+    """Создать или обновить значение пользовательского поля карточки.
+
+    Тело: `key`, `name`, `field_type`, `value` (JSON). При отсутствии определения поля в space — создаётся определение.
+    Возвращает полный detail карточки.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -2169,6 +2471,10 @@ async def delete_card(
     _: None = Depends(require_space_access),
     _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
+    """Удалить карточку и зависимые сущности (каскадно в транзакции).
+
+    Роль manager+. Ответ: `{\"ok\": true, \"card_id\": \"...\"}`.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     async with state.pg_pool.acquire() as conn:
@@ -2201,9 +2507,13 @@ async def create_card(
     request: Request,
     user_id: str = Depends(require_authenticated_user_id),
     _: None = Depends(require_space_access),
-    _role: str = Depends(require_lead_role),
+    _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
-    """Создать новую карточку."""
+    """Создать карточку на доске.
+
+    Тело: `title`, `column_id`, опционально `board_id`, `track_id`, `description`, `due_at`, `planned_*`.
+    Роль менеджера или выше. После создания рассылается уведомление организации. Возвращает detail карточки.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -2312,8 +2622,12 @@ async def assign_card_executor(
     card_id: str,
     user_id: str = Depends(require_authenticated_user_id),
     _: None = Depends(require_space_access),
-    _role: str = Depends(require_lead_role),
+    _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
+    """Назначить исполнителя карточки (участник организации).
+
+    Тело: `user_id`. Таблица `core_cardassignment` (upsert). Роль менеджера или выше.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -2362,9 +2676,12 @@ async def assign_card_executor(
 async def create_space(
     request: Request,
     user_id: str = Depends(require_authenticated_user_id),
-    _role: str = Depends(require_lead_role),
+    _role: str = Depends(require_manager_role),
 ) -> dict[str, Any]:
-    """Создать новое пространство в организации пользователя."""
+    """Создать пространство в организации.
+
+    Тело: `name`. Текущий пользователь должен быть менеджером или админом. Контекст организации из `X-Space-Id` существующего space или тела запроса.
+    """
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -2412,8 +2729,11 @@ async def rename_space(
     space_id: str,
     user_id: str = Depends(require_authenticated_user_id),
 ) -> dict[str, Any]:
-    """Переименовать пространство."""
-    await _require_lead_for_space_org(space_id, user_id)
+    """Переименовать пространство по `space_id`.
+
+    PATCH: `{\"name\": \"...\"}`. Права менеджера или выше. Проверяется принадлежность space к организации пользователя.
+    """
+    await _require_manager_for_space_org(space_id, user_id)
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -2436,8 +2756,11 @@ async def delete_space(
     space_id: str,
     user_id: str = Depends(require_authenticated_user_id),
 ) -> dict[str, Any]:
-    """Удалить пространство и всё содержимое (доски, карточки и т.д.). Нельзя удалить последнее пространство организации."""
-    _, org_id = await _require_lead_for_space_org(space_id, user_id)
+    """Удалить пространство и всё содержимое (доски, карточки, вложения и т.д. по каскаду).
+
+    Нельзя удалить последнее пространство организации. Только менеджер/админ. Долгая операция — выполняется в транзакции.
+    """
+    _, org_id = await _require_manager_for_space_org(space_id, user_id)
     if not state.pg_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     async with state.pg_pool.acquire() as conn:

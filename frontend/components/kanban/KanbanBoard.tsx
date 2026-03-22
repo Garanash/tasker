@@ -66,13 +66,14 @@ type Card = {
   tags?: string[];
   assignee_name?: string | null;
   assignee_user_id?: string | null;
+  assignee_avatar_url?: string | null;
   blocked_count?: number;
   blocking_count?: number;
   comments_count?: number;
   unread_comments_count?: number;
   attachments_count?: number;
 };
-type OrgMember = { id: string; email: string; full_name: string; role: "user" | "executor" | "manager" | "lead" | "admin" };
+type OrgMember = { id: string; email: string; full_name: string; role: "executor" | "manager" | "admin" };
 
 type Column = {
   id: string;
@@ -85,18 +86,71 @@ type Column = {
 
 type BoardGrid = {
   board: { id: string; name: string };
-  effective_role?: "user" | "executor" | "manager" | "lead" | "admin";
+  effective_role?: "executor" | "manager" | "admin";
   tracks: Array<{ id: string; name: string }>;
   columns: Column[];
 };
 
 export type KanbanStatusFilter = "all" | "todo" | "done";
 
+export type KanbanPriorityFilter = "all" | "Терпит" | "Средний" | "Срочно";
+
+export type KanbanDueFilter = "all" | "overdue" | "today" | "week" | "no_due";
+
 export type KanbanFilters = {
   query: string;
   titleOnly: boolean;
   status: KanbanStatusFilter;
+  /** null или пустая строка — любой ответственный */
+  assigneeUserId: string | null;
+  priority: KanbanPriorityFilter;
+  due: KanbanDueFilter;
 };
+
+function normalizeIdish(raw: string | null | undefined): string {
+  if (raw == null) return "";
+  let s = String(raw).trim();
+  if (s.length >= 2 && (s[0] === '"' || s[0] === "'") && s[s.length - 1] === s[0]) {
+    s = s.slice(1, -1).trim();
+  }
+  return s;
+}
+
+function cardEffectiveDueAt(card: Card): string | null {
+  const raw = card.planned_end_at || card.due_at;
+  if (!raw) return null;
+  const t = Date.parse(raw);
+  return Number.isNaN(t) ? null : raw;
+}
+
+function startOfLocalDay(d: Date): Date {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  return x;
+}
+
+function endOfLocalDay(d: Date): Date {
+  const x = new Date(d);
+  x.setHours(23, 59, 59, 999);
+  return x;
+}
+
+function cardMatchesDueFilter(card: Card, due: KanbanDueFilter): boolean {
+  if (due === "all") return true;
+  const raw = cardEffectiveDueAt(card);
+  if (due === "no_due") return !raw;
+  if (!raw) return false;
+  const when = Date.parse(raw);
+  if (Number.isNaN(when)) return false;
+  const now = new Date();
+  const startToday = startOfLocalDay(now).getTime();
+  const endToday = endOfLocalDay(now).getTime();
+  const weekEnd = startToday + 7 * 24 * 60 * 60 * 1000;
+  if (due === "overdue") return when < startToday;
+  if (due === "today") return when >= startToday && when <= endToday;
+  if (due === "week") return when >= startToday && when < weekEnd;
+  return true;
+}
 
 const BORDER_GRAY = "var(--k-text)";
 const TEXT_GRAY = "var(--k-text-muted)";
@@ -165,8 +219,8 @@ const ColumnDroppable = memo(function ColumnDroppable({
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
-          px: 1.5,
-          py: 1,
+          px: 1.25,
+          py: 0.5,
           borderBottom: `1px solid ${BORDER_GRAY}`,
         }}
       >
@@ -195,7 +249,7 @@ const ColumnDroppable = memo(function ColumnDroppable({
                 : undefined
             }
             sx={{
-              fontSize: 14,
+              fontSize: 13,
               fontWeight: 600,
               color: TEXT_DARK,
               m: 0,
@@ -281,9 +335,14 @@ const ColumnDroppable = memo(function ColumnDroppable({
             justifyContent: "flex-start",
             textTransform: "none",
             color: TEXT_GRAY,
-            fontSize: 13,
-            py: 0.75,
-            "&:hover": { bgcolor: "rgba(127,127,127,0.12)" },
+            fontSize: 12,
+            py: 0.45,
+            px: 1,
+            border: "1px solid var(--k-border)",
+            "&:hover": {
+              bgcolor: "rgba(127,127,127,0.08)",
+              border: "1px solid var(--k-border)",
+            },
           }}
         >
           {locale === "en" ? "Add card" : "Добавить карточку"}
@@ -345,9 +404,14 @@ const TrackCellDroppable = memo(function TrackCellDroppable({
               justifyContent: "flex-start",
               textTransform: "none",
               color: TEXT_GRAY,
-              fontSize: 13,
-              py: 0.75,
-              "&:hover": { bgcolor: "rgba(127,127,127,0.12)" },
+              fontSize: 12,
+              py: 0.45,
+              px: 1,
+              border: "1px solid var(--k-border)",
+              "&:hover": {
+                bgcolor: "rgba(127,127,127,0.08)",
+                border: "1px solid var(--k-border)",
+              },
             }}
           >
             {locale === "en" ? "Add card" : "Добавить карточку"}
@@ -388,28 +452,95 @@ export function KanbanBoard({
 
   const [grid, setGrid] = useState<BoardGrid | null>(null);
   const [loading, setLoading] = useState(true);
+  const [gridLoadError, setGridLoadError] = useState<string | null>(null);
+  const [boardNotice, setBoardNotice] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const wsUrl = getWsUrl(`/ws/boards/${boardId}/?token=${encodeURIComponent(token)}`);
 
   const fetchGrid = useCallback(
-    async (nextBoardId: string) => {
-      const res = await fetch(getApiUrl(`/api/kanban/boards/${nextBoardId}/grid`), {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const data = (await res.json()) as BoardGrid;
-      setGrid(data);
-      setLoading(false);
+    async (nextBoardId: string, signal?: AbortSignal) => {
+      if (!nextBoardId || !token?.trim()) {
+        setGrid(null);
+        setGridLoadError(
+          locale === "en" ? "Not signed in or no board selected." : "Нет входа или не выбрана доска.",
+        );
+        return;
+      }
+      try {
+        const res = await fetch(getApiUrl(`/api/kanban/boards/${nextBoardId}/grid`), {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            // Не передаём X-Space-Id: при смене орг/space доска может быть из другого space —
+            // иначе backend отвечает 403 space_forbidden и UI «висел» на Loading.
+          },
+          signal,
+        });
+        const raw = (await res.json().catch(() => null)) as BoardGrid | { detail?: string } | null;
+        if (signal?.aborted) return;
+        if (!res.ok) {
+          const detail = typeof (raw as { detail?: string } | null)?.detail === "string" ? (raw as { detail: string }).detail : null;
+          const msg =
+            detail ||
+            (res.status === 401
+              ? locale === "en"
+                ? "Session expired. Sign in again."
+                : "Сессия истекла. Войдите снова."
+              : locale === "en"
+                ? "Could not load board."
+                : "Не удалось загрузить доску.");
+          setGrid(null);
+          setGridLoadError(msg);
+          setBoardNotice(msg);
+          return;
+        }
+        const data = raw as BoardGrid;
+        if (!data || !Array.isArray(data.columns)) {
+          setGrid(null);
+          const msg = locale === "en" ? "Invalid board response." : "Некорректный ответ сервера для доски.";
+          setGridLoadError(msg);
+          setBoardNotice(msg);
+          return;
+        }
+        setGrid(data);
+        setGridLoadError(null);
+        setBoardNotice(null);
+      } catch (e: unknown) {
+        if (signal?.aborted || (e instanceof DOMException && e.name === "AbortError")) return;
+        const msg =
+          e instanceof Error && e.message
+            ? e.message
+            : locale === "en"
+              ? "Network error while loading the board."
+              : "Ошибка сети при загрузке доски.";
+        setGrid(null);
+        setGridLoadError(msg);
+        setBoardNotice(msg);
+      }
     },
-    [token]
+    [token, locale],
   );
 
   useEffect(() => {
-    fetchGrid(boardId);
+    const ac = new AbortController();
+    let active = true;
+    setLoading(true);
+    setGridLoadError(null);
+    void (async () => {
+      try {
+        await fetchGrid(boardId, ac.signal);
+      } finally {
+        // Не полагаемся на signal.aborted: при смене вкладки «Архив» отмена могла пропустить setLoading(false) и оставить вечный спиннер.
+        if (active) setLoading(false);
+      }
+    })();
+    return () => {
+      active = false;
+      ac.abort();
+    };
   }, [boardId, fetchGrid, refreshToken]);
 
   const [activeCardId, setActiveCardId] = useState<string | null>(null);
-  const [boardNotice, setBoardNotice] = useState<string | null>(null);
   const lastOverIdRef = useRef<string | null>(null);
   const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
   const [selectedCard, setSelectedCard] = useState<CardDetail | null>(null);
@@ -461,6 +592,9 @@ export function KanbanBoard({
       query: (filters?.query ?? "").trim().toLowerCase(),
       titleOnly: Boolean(filters?.titleOnly),
       status: filters?.status ?? "all",
+      assigneeUserId: (filters?.assigneeUserId ?? "").trim(),
+      priority: filters?.priority ?? "all",
+      due: filters?.due ?? "all",
     };
   }, [filters]);
 
@@ -470,15 +604,21 @@ export function KanbanBoard({
     const query = normalizedFilters.query;
     const titleOnly = normalizedFilters.titleOnly;
     const status = normalizedFilters.status;
+    const assigneeId = normalizedFilters.assigneeUserId;
+    const priority = normalizedFilters.priority;
+    const due = normalizedFilters.due;
 
     const hasQuery = query.length > 0;
     const hasStatusFilter = status !== "all";
+    const hasAssignee = assigneeId.length > 0;
+    const hasPriority = priority !== "all";
+    const hasDue = due !== "all";
 
     const sourceColumns =
       grid.effective_role === "executor"
         ? grid.columns.filter((col) => col.name.trim() !== "Задачи")
         : grid.columns;
-    if (!hasQuery && !hasStatusFilter) return sourceColumns;
+    if (!hasQuery && !hasStatusFilter && !hasAssignee && !hasPriority && !hasDue) return sourceColumns;
 
     return sourceColumns.map((col) => {
       let cards = col.cards;
@@ -497,9 +637,27 @@ export function KanbanBoard({
         });
       }
 
+      if (hasAssignee) {
+        cards = cards.filter((card) => normalizeIdish(card.assignee_user_id) === assigneeId);
+      }
+
+      if (hasPriority) {
+        cards = cards.filter((card) => normalizeIdish(card.priority as string | undefined) === priority);
+      }
+
+      if (hasDue) {
+        cards = cards.filter((card) => cardMatchesDueFilter(card, due));
+      }
+
       return { ...col, cards };
     });
   }, [grid, normalizedFilters]);
+
+  /** Общая сетка таблицы по колонкам данных. */
+  const boardGridTemplateColumnsFull = useMemo(
+    () => visibleColumns.map(() => "minmax(260px, 1fr)").join(" "),
+    [visibleColumns],
+  );
 
   const createTrack = useCallback(async () => {
     if (createTrackBusy || !grid) return;
@@ -986,6 +1144,64 @@ export function KanbanBoard({
     [grid, token, activeSpaceId, locale, fetchGrid]
   );
 
+  const removeColumn = useCallback(
+    async (columnId: string) => {
+      if (!grid) return;
+      const column = grid.columns.find((c) => c.id === columnId);
+      if (!column) return;
+      if (grid.columns.length <= 1) {
+        setBoardNotice(locale === "en" ? "Cannot delete the last column" : "Нельзя удалить последнюю колонку");
+        closeColumnMenu();
+        return;
+      }
+      if (column.cards.length > 0) {
+        setBoardNotice(
+          locale === "en"
+            ? "Move cards out of this column before deletion"
+            : "Перед удалением перенесите карточки из этой колонки"
+        );
+        closeColumnMenu();
+        return;
+      }
+      const ok = window.confirm(
+        locale === "en"
+          ? `Delete column "${column.name}"?`
+          : `Удалить колонку «${column.name}»?`
+      );
+      if (!ok) return;
+      try {
+        const res = await fetch(getApiUrl(`/api/kanban/columns/${columnId}`), {
+          method: "DELETE",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
+          },
+        });
+        const data = (await res.json().catch(() => null)) as { detail?: string } | null;
+        if (!res.ok) {
+          const detail = data?.detail;
+          if (detail === "cannot_delete_last_column") {
+            throw new Error(locale === "en" ? "Cannot delete the last column" : "Нельзя удалить последнюю колонку");
+          }
+          if (detail === "column_not_empty") {
+            throw new Error(
+              locale === "en"
+                ? "Move cards out of this column before deletion"
+                : "Перед удалением перенесите карточки из этой колонки"
+            );
+          }
+          throw new Error(detail ?? (locale === "en" ? "Could not delete column" : "Не удалось удалить колонку"));
+        }
+        closeColumnMenu();
+        await fetchGrid(grid.board.id);
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        setBoardNotice(msg || (locale === "en" ? "Could not delete column" : "Не удалось удалить колонку"));
+      }
+    },
+    [grid, locale, closeColumnMenu, token, activeSpaceId, fetchGrid]
+  );
+
   return (
     <Box sx={{ height: "100%", display: "flex", flexDirection: "column" }}>
       <Dialog
@@ -1395,6 +1611,12 @@ export function KanbanBoard({
               </ListItemIcon>
               <ListItemText primary={locale === "en" ? "Move right" : "Переместить вправо"} />
             </MenuItem>
+            <MenuItem onClick={() => columnMenuColumnId && void removeColumn(columnMenuColumnId)}>
+              <ListItemIcon>
+                <DeleteOutlineIcon sx={{ fontSize: 20, color: "#d32f2f" }} />
+              </ListItemIcon>
+              <ListItemText primary={locale === "en" ? "Delete column" : "Удалить колонку"} />
+            </MenuItem>
           </>
         ) : null}
 
@@ -1505,7 +1727,7 @@ export function KanbanBoard({
         </MenuItem>
       </Menu>
 
-      {loading || !grid ? (
+      {loading ? (
         <Box
           sx={{
             flex: 1,
@@ -1516,6 +1738,24 @@ export function KanbanBoard({
           }}
         >
           {locale === "en" ? "Loading board..." : "Загрузка доски..."}
+        </Box>
+      ) : !grid ? (
+        <Box
+          sx={{
+            flex: 1,
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            color: TEXT_GRAY,
+            gap: 1,
+            px: 2,
+            textAlign: "center",
+          }}
+        >
+          <Typography sx={{ color: "#C62828", fontSize: 14, maxWidth: 480 }}>
+            {gridLoadError ?? (locale === "en" ? "Could not load board." : "Не удалось загрузить доску.")}
+          </Typography>
         </Box>
       ) : hasTracksLayout ? (
         <DndContext
@@ -1583,150 +1823,245 @@ export function KanbanBoard({
             flex: 1,
             bgcolor: "var(--k-page-bg)",
             minHeight: 0,
+            minWidth: 0,
+            width: "100%",
+            boxSizing: "border-box",
           }}
         >
           <Box
             sx={{
-              minWidth: Math.max(980, visibleColumns.length * 280 + (canManageColumns ? 260 : 0)),
-              flex: 1,
+              display: "flex",
+              flexDirection: "row",
+              alignItems: "flex-start",
+              gap: 1,
+              width: "100%",
+              minWidth: Math.max(
+                980,
+                visibleColumns.length * 280 + (canManageColumns ? 8 + 280 : 0),
+              ),
               minHeight: 0,
             }}
           >
             <Box
               sx={{
-                display: "grid",
-                gridTemplateColumns:
-                  visibleColumns.map(() => "minmax(260px, 1fr)").join(" ") +
-                  (canManageColumns ? " minmax(220px, 280px)" : ""),
-                gap: 1,
-                mb: 1,
+                flex: "0 0 auto",
+                width: "max-content",
+                maxWidth: "100%",
+                minWidth: 0,
               }}
             >
-              {visibleColumns.map((column) => (
-                <Box
-                  key={`head-${column.id}`}
-                  sx={{
-                    p: 2,
-                    minHeight: 88,
-                    borderRadius: 1.5,
-                    border: "1px solid var(--k-border)",
-                    bgcolor: "var(--k-surface-bg)",
-                    color: "var(--k-text)",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                  }}
-                >
-                  <Typography
+            <Box
+              sx={{
+                display: "grid",
+                gridTemplateColumns: boardGridTemplateColumnsFull,
+                gap: 1,
+                mb: 0.5,
+                alignItems: "start",
+              }}
+            >
+                {visibleColumns.map((column) => (
+                  <Box
+                    key={`head-${column.id}`}
                     sx={{
-                      fontSize: { xs: 16, sm: 18 },
-                      fontWeight: 800,
-                      letterSpacing: "-0.02em",
-                      lineHeight: 1.25,
-                      textAlign: "center",
-                      wordBreak: "break-word",
-                      hyphens: "auto",
+                      px: 0.4,
+                      py: 0,
+                      minHeight: 0,
+                      borderRadius: 0.5,
+                      border: "1px solid var(--k-border)",
+                      bgcolor: "var(--k-surface-bg)",
+                      color: "var(--k-text)",
+                      display: "flex",
+                      flexDirection: "column",
+                      justifyContent: "center",
                     }}
                   >
-                    {column.name}
-                  </Typography>
-                </Box>
-              ))}
-              {canManageColumns ? (
+                    <Box
+                      sx={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: 0.35,
+                        minWidth: 0,
+                      }}
+                    >
+                      <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, minWidth: 0, flex: 1 }}>
+                        <Typography
+                          className="boardTitle"
+                          component={canManageColumns ? "button" : "p"}
+                          type={canManageColumns ? "button" : undefined}
+                          onClick={canManageColumns ? () => openRenameColumnDialog(column.id) : undefined}
+                          onKeyDown={
+                            canManageColumns
+                              ? (e: KeyboardEvent) => {
+                                  if (e.key === "Enter" || e.key === " ") {
+                                    e.preventDefault();
+                                    openRenameColumnDialog(column.id);
+                                  }
+                                }
+                              : undefined
+                          }
+                          tabIndex={canManageColumns ? 0 : undefined}
+                          title={
+                            canManageColumns
+                              ? locale === "en"
+                                ? "Click to rename column"
+                                : "Нажмите, чтобы переименовать колонку"
+                              : undefined
+                          }
+                          sx={{
+                            fontSize: 11,
+                            fontWeight: 700,
+                            letterSpacing: "-0.02em",
+                            lineHeight: 1.2,
+                            textAlign: "left",
+                            wordBreak: "break-word",
+                            hyphens: "auto",
+                            m: 0,
+                            p: 0,
+                            border: "none",
+                            background: "none",
+                            font: "inherit",
+                            color: "inherit",
+                            cursor: canManageColumns ? "pointer" : "default",
+                            minWidth: 0,
+                            ...(canManageColumns
+                              ? {
+                                  "&:hover": {
+                                    color: "var(--k-text)",
+                                    textDecoration: "underline",
+                                    textUnderlineOffset: 2,
+                                  },
+                                  "&:focus-visible": {
+                                    outline: "2px solid #9C27B0",
+                                    outlineOffset: 2,
+                                    borderRadius: 0.5,
+                                  },
+                                }
+                              : {}),
+                          }}
+                        >
+                          {column.name}
+                        </Typography>
+                        <Typography
+                          sx={{
+                            fontSize: 9,
+                            color: TEXT_GRAY,
+                            bgcolor: "rgba(127,127,127,0.12)",
+                            px: 0.3,
+                            py: 0,
+                            borderRadius: 0.5,
+                            fontWeight: 600,
+                            flexShrink: 0,
+                            lineHeight: 1.35,
+                          }}
+                        >
+                          {column.cards.length}
+                        </Typography>
+                      </Box>
+                      {canManageColumns ? (
+                        <Box sx={{ display: "flex", alignItems: "center", flexShrink: 0 }}>
+                          <IconButton
+                            size="small"
+                            aria-label={locale === "en" ? "Rename column" : "Переименовать колонку"}
+                            onClick={() => openRenameColumnDialog(column.id)}
+                            sx={{ p: 0.15, color: "var(--k-text-muted)", "&:hover": { bgcolor: "var(--k-border)" } }}
+                          >
+                            <EditIcon sx={{ fontSize: 12 }} />
+                          </IconButton>
+                          <IconButton
+                            size="small"
+                            aria-label={locale === "en" ? "Column menu" : "Меню колонки"}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              openColumnMenu(e.currentTarget, column.id);
+                            }}
+                            sx={{ p: 0.15, color: "var(--k-text-muted)", "&:hover": { bgcolor: "var(--k-border)" } }}
+                          >
+                            <MoreHorizIcon sx={{ fontSize: 12 }} />
+                          </IconButton>
+                        </Box>
+                      ) : null}
+                    </Box>
+                  </Box>
+                ))}
+              </Box>
+
+              <Box
+                sx={{
+                  display: "grid",
+                  gridTemplateColumns: boardGridTemplateColumnsFull,
+                  gap: 1,
+                  mb: 1,
+                }}
+              >
                 <Box
                   sx={{
-                    p: 1.5,
-                    borderRadius: 1.5,
-                    border: "1px dashed var(--k-border)",
-                    bgcolor: "var(--k-surface-bg)",
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: 1,
-                    justifyContent: "center",
-                    minHeight: "100%",
+                    gridColumn: canManageColumns ? `1 / ${visibleColumns.length + 1}` : "1 / -1",
+                    borderBottom: "1px solid var(--k-border)",
+                    minHeight: 1,
+                    alignSelf: "end",
                   }}
-                >
-                  <Button
-                    variant="text"
-                    size="small"
-                    onClick={() => void createColumn()}
-                    disabled={createColumnBusy}
-                    startIcon={<AddIcon />}
-                    sx={{ textTransform: "none", color: "var(--k-text)", fontWeight: 600, justifyContent: "flex-start" }}
-                  >
-                    {createColumnBusy
-                      ? locale === "en"
-                        ? "Creating..."
-                        : "Создание..."
-                      : locale === "en"
-                        ? "Add column"
-                        : "Добавить колонку"}
-                  </Button>
-                  <Button
-                    variant="text"
-                    size="small"
-                    onClick={() => void createTrack()}
-                    disabled={createTrackBusy}
-                    startIcon={<AddIcon />}
-                    sx={{ textTransform: "none", color: "var(--k-text)", fontWeight: 600, justifyContent: "flex-start" }}
-                  >
-                    {createTrackBusy
-                      ? locale === "en"
-                        ? "Creating..."
-                        : "Создание..."
-                      : locale === "en"
-                        ? "Add row"
-                        : "Добавить дорожку"}
-                  </Button>
-                </Box>
-              ) : null}
-            </Box>
+                />
+              </Box>
 
             {grid!.tracks.map((track) => {
               const isHidden = hiddenTrackIds.includes(track.id);
               const cardsTotal = visibleColumns.reduce((sum, col) => sum + getCardsForTrackColumn(col, track.id).length, 0);
               return (
-                <Box key={track.id} sx={{ mb: 1.25 }}>
+                <Box key={track.id} sx={{ mb: 1.25, width: "100%" }}>
                   <Box
                     sx={{
-                      height: 42,
-                      borderRadius: 1.25,
-                      border: "1px solid var(--k-border)",
-                      bgcolor: "var(--k-surface-bg)",
-                      px: 1.5,
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
+                      display: "grid",
+                      gridTemplateColumns: boardGridTemplateColumnsFull,
+                      gap: 1,
+                      mb: 0.75,
                     }}
                   >
-                    <Typography sx={{ fontSize: 13, fontWeight: 700, color: "var(--k-text)" }}>
-                      {track.name} {cardsTotal}
-                    </Typography>
-                    <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
-                      <IconButton size="small" onClick={() => toggleTrackVisibility(track.id)} title={locale === "en" ? "Hide/show track" : "Скрыть/показать дорожку"}>
-                        <VisibilityOffOutlinedIcon sx={{ fontSize: 17, color: "var(--k-text-muted)" }} />
-                      </IconButton>
-                      <IconButton
-                        size="small"
-                        onClick={() => openRenameTrackDialog(track.id, track.name)}
-                        title={locale === "en" ? "Rename track" : "Переименовать дорожку"}
-                      >
-                        <EditIcon sx={{ fontSize: 17, color: "var(--k-text-muted)" }} />
-                      </IconButton>
-                      <IconButton size="small" onClick={() => void removeTrack(track.id)} title={locale === "en" ? "Delete track" : "Удалить дорожку"}>
-                        <DeleteOutlineIcon sx={{ fontSize: 17, color: "#d32f2f" }} />
-                      </IconButton>
+                    <Box
+                      sx={{
+                        gridColumn: canManageColumns ? `1 / ${visibleColumns.length + 1}` : "1 / -1",
+                        minHeight: 30,
+                        py: 0.35,
+                        borderRadius: 1.25,
+                        border: "1px solid var(--k-border)",
+                        bgcolor: "var(--k-surface-bg)",
+                        px: 1,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        width: "100%",
+                        minWidth: 0,
+                        boxSizing: "border-box",
+                      }}
+                    >
+                      <Typography sx={{ fontSize: 12, fontWeight: 700, color: "var(--k-text)", lineHeight: 1.2 }}>
+                        {track.name} {cardsTotal}
+                      </Typography>
+                      <Box sx={{ display: "flex", alignItems: "center", gap: 0.25 }}>
+                        <IconButton size="small" onClick={() => toggleTrackVisibility(track.id)} title={locale === "en" ? "Hide/show track" : "Скрыть/показать дорожку"} sx={{ p: 0.35 }}>
+                          <VisibilityOffOutlinedIcon sx={{ fontSize: 15, color: "var(--k-text-muted)" }} />
+                        </IconButton>
+                        <IconButton
+                          size="small"
+                          onClick={() => openRenameTrackDialog(track.id, track.name)}
+                          title={locale === "en" ? "Rename track" : "Переименовать дорожку"}
+                          sx={{ p: 0.35 }}
+                        >
+                          <EditIcon sx={{ fontSize: 15, color: "var(--k-text-muted)" }} />
+                        </IconButton>
+                        <IconButton size="small" onClick={() => void removeTrack(track.id)} title={locale === "en" ? "Delete track" : "Удалить дорожку"} sx={{ p: 0.35 }}>
+                          <DeleteOutlineIcon sx={{ fontSize: 15, color: "#d32f2f" }} />
+                        </IconButton>
+                      </Box>
                     </Box>
                   </Box>
                   {!isHidden ? (
                     <Box
                       sx={{
                         display: "grid",
-                        gridTemplateColumns:
-                          visibleColumns.map(() => "minmax(260px, 1fr)").join(" ") +
-                          (canManageColumns ? " minmax(220px, 280px)" : ""),
+                        gridTemplateColumns: boardGridTemplateColumnsFull,
                         gap: 1,
-                        mt: 0.75,
+                        mt: 0,
                       }}
                     >
                       {visibleColumns.map((column) => {
@@ -1751,33 +2086,105 @@ export function KanbanBoard({
                                 priority={card.priority}
                                 tags={card.tags}
                                 assigneeName={card.assignee_name}
+                                assigneeAvatarUrl={card.assignee_avatar_url}
                                 blockedCount={card.blocked_count}
                                 blockingCount={card.blocking_count}
                                 commentsCount={card.comments_count}
                                 unreadCommentsCount={card.unread_comments_count}
                                 attachmentsCount={card.attachments_count}
                                 plannedEndAt={card.planned_end_at || card.due_at}
+                                currentUserRole={grid?.effective_role}
                               />
                             ))}
                           </TrackCellDroppable>
                         );
                       })}
-                      {canManageColumns ? (
-                        <Box
-                          aria-hidden
-                          sx={{
-                            minHeight: 120,
-                            borderRadius: 1.5,
-                            border: "1px solid transparent",
-                            bgcolor: "transparent",
-                          }}
-                        />
-                      ) : null}
                     </Box>
                   ) : null}
                 </Box>
               );
             })}
+          </Box>
+            {canManageColumns ? (
+              <Box
+                sx={{
+                  flex: "0 0 auto",
+                  width: 280,
+                  p: 1.25,
+                  minHeight: 128,
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 1,
+                  justifyContent: "flex-start",
+                  borderRadius: 2,
+                  border: "2px dashed rgba(156, 39, 176, 0.35)",
+                  bgcolor: "rgba(127,127,127,0.06)",
+                  boxShadow: "0 4px 20px rgba(0,0,0,0.14)",
+                  minWidth: 0,
+                }}
+              >
+                <Button
+                  fullWidth
+                  size="medium"
+                  onClick={() => void createTrack()}
+                  disabled={createTrackBusy}
+                  startIcon={<AddIcon sx={{ fontSize: 20 }} />}
+                  sx={{
+                    justifyContent: "flex-start",
+                    textTransform: "none",
+                    color: TEXT_GRAY,
+                    fontSize: 13,
+                    py: 1,
+                    minHeight: 44,
+                    px: 1,
+                    border: "1px solid var(--k-border)",
+                    fontWeight: 600,
+                    "&:hover": {
+                      bgcolor: "rgba(127,127,127,0.08)",
+                      border: "1px solid var(--k-border)",
+                    },
+                  }}
+                >
+                  {createTrackBusy
+                    ? locale === "en"
+                      ? "Creating..."
+                      : "Создание..."
+                    : locale === "en"
+                      ? "Add row"
+                      : "Добавить дорожку"}
+                </Button>
+                <Button
+                  fullWidth
+                  size="medium"
+                  onClick={() => void createColumn()}
+                  disabled={createColumnBusy}
+                  startIcon={<AddIcon sx={{ fontSize: 20 }} />}
+                  sx={{
+                    justifyContent: "flex-start",
+                    textTransform: "none",
+                    color: TEXT_GRAY,
+                    fontSize: 13,
+                    py: 1,
+                    minHeight: 44,
+                    px: 1,
+                    border: "1px solid var(--k-border)",
+                    fontWeight: 600,
+                    "&:hover": {
+                      bgcolor: "rgba(127,127,127,0.08)",
+                      border: "1px solid var(--k-border)",
+                    },
+                  }}
+                >
+                  {createColumnBusy
+                    ? locale === "en"
+                      ? "Creating..."
+                      : "Создание..."
+                    : locale === "en"
+                      ? "Add column"
+                      : "Добавить колонку"}
+                </Button>
+              </Box>
+            ) : null}
           </Box>
         </Box>
           <BoardDragOverlayPortal>
@@ -1882,12 +2289,14 @@ export function KanbanBoard({
                     priority={card.priority}
                     tags={card.tags}
                     assigneeName={card.assignee_name}
+                    assigneeAvatarUrl={card.assignee_avatar_url}
                     blockedCount={card.blocked_count}
                     blockingCount={card.blocking_count}
                     commentsCount={card.comments_count}
                     unreadCommentsCount={card.unread_comments_count}
                     attachmentsCount={card.attachments_count}
                     plannedEndAt={card.planned_end_at || card.due_at}
+                    currentUserRole={grid?.effective_role}
                   />
                 ))}
               </ColumnDroppable>
@@ -1958,6 +2367,8 @@ export function KanbanBoard({
       {selectedCard && (
         <CardModal
           card={selectedCard}
+          locale={locale}
+          currentUserRole={grid?.effective_role}
           isFavorite={favoriteCardIds.includes(selectedCard.id)}
           onToggleFavorite={() => toggleFavorite(selectedCard.id)}
           onCreateRelatedCard={() =>
@@ -2019,72 +2430,6 @@ export function KanbanBoard({
             setSelectedCard(null);
             setSelectedCardId(null);
             setSelectedError(null);
-          }}
-          onAddChecklist={async (title) => {
-            if (!selectedCardId) return;
-            setSelectedError(null);
-            try {
-              const res = await fetch(getApiUrl(`/api/kanban/cards/${selectedCardId}/checklists`), {
-                method: "POST",
-                headers: {
-                  Authorization: `Bearer ${token}`,
-                  "Content-Type": "application/json",
-                  ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
-                },
-                body: JSON.stringify({ title }),
-              });
-              const data = await res.json().catch(() => null);
-              if (!res.ok) throw new Error(data?.detail ?? "Не удалось создать чек-лист");
-              await loadCardDetails(selectedCardId);
-              await fetchGrid(boardId);
-              if (data && typeof data === "object" && "id" in data && typeof data.id === "string") {
-                return { id: data.id };
-              }
-            } catch (e: any) {
-              setSelectedError(e?.message ?? "Не удалось создать чек-лист");
-            }
-          }}
-          onAddChecklistItem={async (checklistId, title) => {
-            if (!selectedCardId) return;
-            setSelectedError(null);
-            try {
-              const res = await fetch(getApiUrl(`/api/kanban/checklists/${checklistId}/items`), {
-                method: "POST",
-                headers: {
-                  Authorization: `Bearer ${token}`,
-                  "Content-Type": "application/json",
-                  ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
-                },
-                body: JSON.stringify({ title }),
-              });
-              const data = await res.json().catch(() => null);
-              if (!res.ok) throw new Error(data?.detail ?? "Не удалось создать пункт");
-              await loadCardDetails(selectedCardId);
-              await fetchGrid(boardId);
-            } catch (e: any) {
-              setSelectedError(e?.message ?? "Не удалось создать пункт");
-            }
-          }}
-          onToggleChecklistItem={async (itemId, isDone) => {
-            if (!selectedCardId) return;
-            setSelectedError(null);
-            try {
-              const res = await fetch(getApiUrl(`/api/kanban/checklist-items/${itemId}`), {
-                method: "PATCH",
-                headers: {
-                  Authorization: `Bearer ${token}`,
-                  "Content-Type": "application/json",
-                  ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
-                },
-                body: JSON.stringify({ is_done: isDone }),
-              });
-              const data = await res.json().catch(() => null);
-              if (!res.ok) throw new Error(data?.detail ?? "Не удалось обновить пункт");
-              await loadCardDetails(selectedCardId);
-              await fetchGrid(boardId);
-            } catch (e: any) {
-              setSelectedError(e?.message ?? "Не удалось обновить пункт");
-            }
           }}
           onAddComment={async (body) => {
             if (!selectedCardId) return;
@@ -2156,6 +2501,37 @@ export function KanbanBoard({
               setSelectedError(e?.message ?? "Не удалось добавить вложение по ссылке");
             }
           }}
+          onDeleteAttachment={
+            grid?.effective_role === "manager" || grid?.effective_role === "admin"
+              ? async (attachmentId) => {
+                  if (!selectedCardId) return;
+                  setSelectedError(null);
+                  try {
+                    const res = await fetch(
+                      getApiUrl(`/api/kanban/cards/${selectedCardId}/attachments/${attachmentId}`),
+                      {
+                        method: "DELETE",
+                        headers: {
+                          Authorization: `Bearer ${token}`,
+                          ...(activeSpaceId ? { "X-Space-Id": activeSpaceId } : {}),
+                        },
+                      },
+                    );
+                    const data = (await res.json().catch(() => null)) as { detail?: string } | null;
+                    if (!res.ok) {
+                      throw new Error(data?.detail ?? "Не удалось удалить вложение");
+                    }
+                    await loadCardDetails(selectedCardId);
+                  } catch (e: unknown) {
+                    setSelectedError(
+                      e instanceof Error && e.message
+                        ? e.message
+                        : "Не удалось удалить вложение",
+                    );
+                  }
+                }
+              : undefined
+          }
         />
       )}
 

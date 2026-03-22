@@ -2,23 +2,29 @@
 
 import { useMemo, useState } from "react";
 import type { ReactNode } from "react";
+import { useRouter } from "next/navigation";
 
 import {
+  Avatar,
   Badge,
   Box,
   Button,
   Divider,
   Drawer,
+  FormControl,
   IconButton,
   InputAdornment,
   Menu,
   MenuItem,
   OutlinedInput,
+  Select,
+  ToggleButton,
+  ToggleButtonGroup,
   Typography,
   useTheme,
 } from "@mui/material";
-import AccountCircleIcon from "@mui/icons-material/AccountCircle";
 import NotificationsIcon from "@mui/icons-material/Notifications";
+import MailOutlineIcon from "@mui/icons-material/MailOutline";
 import MenuIcon from "@mui/icons-material/Menu";
 import SearchIcon from "@mui/icons-material/Search";
 import HelpOutlineIcon from "@mui/icons-material/HelpOutline";
@@ -39,12 +45,28 @@ import LeftSidebar from "./LeftSidebar";
 import RightRail from "./RightRail";
 import ProfileMenu, { type ColorTheme } from "./ProfileMenu";
 import { setStoredLanguage, setStoredTheme, type AppLanguage } from "@/lib/preferences";
+import { getApiUrl } from "@/lib/api";
+
+function resolveHeaderAvatarSrc(avatarUrl: string | undefined): string | undefined {
+  const u = (avatarUrl || "").trim();
+  if (!u) return undefined;
+  if (u.startsWith("http://") || u.startsWith("https://")) return u;
+  return getApiUrl(u.startsWith("/") ? u : `/${u}`);
+}
 
 export type AppShellSpace = { id: string; name: string };
 export type AppShellBoard = { id: string; name: string; space_id?: string; project_id?: string };
 export type AppShellProject = { id: string; name: string; space_id?: string };
+export type AppShellOrganization = { id: string; name: string };
+export type AppShellOrganizationMember = {
+  id: string;
+  full_name: string;
+  email: string;
+  avatar_url?: string;
+  role: string;
+};
 export type AddAction = "folder" | "space" | "storymap" | "document" | "board";
-export type AppRole = "user" | "executor" | "manager" | "lead" | "admin";
+export type AppRole = "executor" | "manager" | "admin";
 export type AppNotification = {
   id: string;
   title: string;
@@ -76,6 +98,16 @@ const ACCENT_PURPLE = "#9C27B0";
 type Props = {
   children: ReactNode;
 
+  organizations?: AppShellOrganization[];
+  activeOrganizationId?: string | null;
+  onSelectOrganization?: (organizationId: string) => void;
+  canRenameOrganization?: (organizationId: string) => boolean;
+  onRenameOrganization?: (organizationId: string, newName: string) => void | Promise<boolean | void>;
+  organizationMembers?: AppShellOrganizationMember[];
+  organizationMembersLoading?: boolean;
+  currentUserId?: string | null;
+  onOpenDirectMessage?: (member: AppShellOrganizationMember) => void;
+
   spaces: AppShellSpace[];
   projects?: AppShellProject[];
   boards: AppShellBoard[];
@@ -89,7 +121,7 @@ type Props = {
   /** true если переименование на сервере прошло успешно */
   onRenameSpace?: (spaceId: string, newName: string) => void | Promise<boolean>;
   onRenameBoard?: (boardId: string, newName: string) => void | Promise<boolean>;
-  /** Удаление пространства (lead/admin). Вернуть false при ошибке — диалог останется открытым. */
+  /** Удаление пространства (менеджер/админ). Вернуть false при ошибке — диалог останется открытым. */
   onDeleteSpace?: (spaceId: string) => boolean | Promise<boolean> | void | Promise<void>;
   /** Удаление доски (manager+). Вернуть false при ошибке — диалог останется открытым. */
   onDeleteBoard?: (boardId: string) => boolean | Promise<boolean> | void | Promise<void>;
@@ -105,15 +137,23 @@ type Props = {
   onReadNotification?: (notificationId: string) => void;
   onReadAllNotifications?: () => void;
 
+  /** Непрочитанные личные сообщения в текущей организации */
+  directMessageUnreadCount?: number;
+  /** Доп. действие при клике на конверт (например обновить счётчик). По умолчанию открывается левое меню. */
+  onDirectMessagesClick?: () => void;
+
   viewMode?: ViewMode;
   onViewModeChange?: (mode: ViewMode) => void;
 
   onCreateClick?: () => void;
   onCreateSpaceClick?: () => void;
+  /** Левый сайдбар: пункт «Доску» (шапка по-прежнему использует onAddAction). */
   onCreateBoardClick?: () => void;
   onAddAction?: (action: AddAction) => void;
   onOpenAdministration?: () => void;
   onOpenTemplates?: () => void;
+  /** Открыть попап фильтров задач, якорь — кнопка в шапке */
+  onOpenTaskFilters?: (anchorEl: HTMLElement) => void;
   currentUserRole?: AppRole;
   canManageCurrentSpace?: boolean;
 
@@ -129,6 +169,15 @@ type Props = {
 
 export default function AppShell({
   children,
+  organizations = [],
+  activeOrganizationId = null,
+  onSelectOrganization,
+  canRenameOrganization,
+  onRenameOrganization,
+  organizationMembers = [],
+  organizationMembersLoading = false,
+  currentUserId = null,
+  onOpenDirectMessage,
   spaces,
   projects = [],
   boards,
@@ -150,6 +199,8 @@ export default function AppShell({
   onOpenNotifications,
   onReadNotification,
   onReadAllNotifications,
+  directMessageUnreadCount = 0,
+  onDirectMessagesClick,
   viewMode = "board",
   onViewModeChange,
   onCreateClick,
@@ -158,7 +209,8 @@ export default function AppShell({
   onAddAction,
   onOpenAdministration,
   onOpenTemplates,
-  currentUserRole = "user",
+  onOpenTaskFilters,
+  currentUserRole = "executor",
   canManageCurrentSpace,
   userName = "Пользователь",
   userEmail = "user@example.com",
@@ -170,19 +222,22 @@ export default function AppShell({
   onColorThemeChange,
 }: Props) {
   const theme = useTheme();
+  const router = useRouter();
+  const headerAvatarSrc = useMemo(() => resolveHeaderAvatarSrc(avatarUrl), [avatarUrl]);
+  const headerAvatarLetter = (userName.trim() || userEmail.trim() || "?").charAt(0).toUpperCase();
   const [leftDrawerOpen, setLeftDrawerOpen] = useState(false);
   const [sidebarPinned, setSidebarPinned] = useState(false);
   const [profileAnchorEl, setProfileAnchorEl] = useState<null | HTMLElement>(null);
   const [notificationAnchorEl, setNotificationAnchorEl] = useState<null | HTMLElement>(null);
   const [searchValue, setSearchValue] = useState("");
-  const [viewModeAnchor, setViewModeAnchor] = useState<null | HTMLElement>(null);
   const [addMenuAnchor, setAddMenuAnchor] = useState<null | HTMLElement>(null);
   const t = useMemo(
     () =>
       language === "en"
         ? {
             search: "Search",
-            lists: "Lists",
+            messages: "Messages",
+            lists: "Tasks",
             reports: "Reports",
             archive: "Archive",
             filters: "Filters",
@@ -202,7 +257,8 @@ export default function AppShell({
           }
         : {
             search: "Найти",
-            lists: "Списки",
+            messages: "Сообщения",
+            lists: "Задачи",
             reports: "Отчёты",
             archive: "Архив",
             filters: "Фильтры",
@@ -224,9 +280,8 @@ export default function AppShell({
   );
 
   const activeSpaceName = spaces.find((s) => s.id === activeSpaceId)?.name ?? "Первое пространство";
-  const currentViewMode = VIEW_MODES.find((v) => v.id === viewMode) || VIEW_MODES[0];
-  const canCreateEntities = currentUserRole !== "user" && currentUserRole !== "executor";
-  const canCreateSpace = currentUserRole === "lead" || currentUserRole === "admin";
+  const canCreateEntities = currentUserRole === "manager" || currentUserRole === "admin";
+  const canCreateSpace = currentUserRole === "manager" || currentUserRole === "admin";
   const canManageSpaces = canManageCurrentSpace ?? canCreateSpace;
   const canManageBoards = canCreateEntities;
   const canOpenAdministration = currentUserRole === "admin";
@@ -291,6 +346,38 @@ export default function AppShell({
             AGB Tasks
           </Typography>
         </Box>
+
+        {organizations.length > 0 && onSelectOrganization ? (
+          <FormControl size="small" sx={{ minWidth: { xs: 130, sm: 200 }, maxWidth: 280 }}>
+            <Select
+              value={activeOrganizationId || ""}
+              onChange={(e) => onSelectOrganization(String(e.target.value))}
+              displayEmpty
+              data-testid="header-organization-select"
+              inputProps={{
+                "aria-label": language === "en" ? "Organization" : "Организация",
+              }}
+              sx={{
+                color: "#fff",
+                fontSize: 13,
+                height: 36,
+                borderRadius: 1,
+                "& .MuiOutlinedInput-notchedOutline": { borderColor: "rgba(255,255,255,0.22)" },
+                "&:hover .MuiOutlinedInput-notchedOutline": { borderColor: "rgba(255,255,255,0.42)" },
+                "&.Mui-focused .MuiOutlinedInput-notchedOutline": { borderColor: "rgba(255,255,255,0.55)" },
+                "& .MuiSvgIcon-root": { color: "rgba(255,255,255,0.75)" },
+                bgcolor: "rgba(255,255,255,0.08)",
+              }}
+              MenuProps={{ PaperProps: { sx: { maxHeight: 320, bgcolor: "var(--k-surface-bg, #111)", color: "var(--k-text)" } } }}
+            >
+              {organizations.map((org) => (
+                <MenuItem key={org.id} value={org.id}>
+                  {org.name}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+        ) : null}
 
         <Box sx={{ flex: 1 }} />
 
@@ -361,8 +448,32 @@ export default function AppShell({
           {isDarkTheme ? <DarkModeOutlinedIcon fontSize="small" /> : <LightModeOutlinedIcon fontSize="small" />}
         </IconButton>
 
-        <IconButton size="small" aria-label="Справка" sx={{ color: "rgba(255,255,255,0.8)" }}>
+        <IconButton
+          size="small"
+          aria-label={language === "en" ? "Help and wiki" : "Справка и вики"}
+          onClick={() => {
+            const external = process.env.NEXT_PUBLIC_WIKI_URL?.trim();
+            if (external) window.open(external, "_blank", "noopener,noreferrer");
+            else router.push("/wiki");
+          }}
+          sx={{ color: "rgba(255,255,255,0.8)" }}
+        >
           <HelpOutlineIcon fontSize="small" />
+        </IconButton>
+
+        <IconButton
+          size="small"
+          aria-label={t.messages}
+          data-testid="header-messages"
+          onClick={() => {
+            setLeftDrawerOpen(true);
+            onDirectMessagesClick?.();
+          }}
+          sx={{ color: "rgba(255,255,255,0.8)" }}
+        >
+          <Badge badgeContent={directMessageUnreadCount > 0 ? directMessageUnreadCount : undefined} color="error">
+            <MailOutlineIcon fontSize="small" />
+          </Badge>
         </IconButton>
 
         {/* Уведомления с бейджем */}
@@ -385,10 +496,23 @@ export default function AppShell({
         <IconButton
           size="small"
           aria-label="Профиль"
+          data-testid="header-profile-avatar"
           onClick={(e) => setProfileAnchorEl(e.currentTarget)}
-          sx={{ color: "rgba(255,255,255,0.8)" }}
+          sx={{ color: "rgba(255,255,255,0.8)", p: 0.25 }}
         >
-          <AccountCircleIcon />
+          <Avatar
+            src={headerAvatarSrc}
+            sx={{
+              width: 28,
+              height: 28,
+              fontSize: 14,
+              fontWeight: 600,
+              bgcolor: ACCENT_PURPLE,
+              border: "1px solid rgba(255,255,255,0.25)",
+            }}
+          >
+            {headerAvatarLetter}
+          </Avatar>
         </IconButton>
       </Box>
 
@@ -463,25 +587,46 @@ export default function AppShell({
 
         <Divider orientation="vertical" flexItem sx={{ mx: 1, borderColor: BORDER_GRAY }} />
 
-        {/* Выпадающий селектор вида */}
-        <Button
-          size="small"
-          onClick={(e) => setViewModeAnchor(e.currentTarget)}
-          endIcon={<KeyboardArrowDownIcon />}
-          startIcon={currentViewMode.icon}
+        <ToggleButtonGroup
+          exclusive
+          value={viewMode}
+          onChange={(_, next: ViewMode | null) => {
+            if (next) onViewModeChange?.(next);
+          }}
+          aria-label={language === "en" ? "View mode" : "Режим отображения"}
           sx={{
-            textTransform: "none",
-            fontWeight: 500,
-            fontSize: 13,
-            color: TEXT_DARK,
-            bgcolor: "var(--k-hover, #F5F5F5)",
-            borderRadius: 1,
-            px: 1.5,
-            "&:hover": { bgcolor: "var(--k-active, #E8E8E8)" },
+            gap: 0.25,
+            "& .MuiToggleButtonGroup-grouped": {
+              border: 0,
+              borderRadius: "8px !important",
+              px: 0.75,
+              py: 0.5,
+              minWidth: 36,
+            },
           }}
         >
-          {t.viewModes[currentViewMode.id]}
-        </Button>
+          {VIEW_MODES.map((mode) => (
+            <ToggleButton
+              key={mode.id}
+              value={mode.id}
+              aria-label={t.viewModes[mode.id]}
+              title={t.viewModes[mode.id]}
+              sx={{
+                color: viewMode === mode.id ? TEXT_DARK : TEXT_GRAY,
+                bgcolor: viewMode === mode.id ? "var(--k-active, #E8E8E8)" : "transparent",
+                border: "none",
+                "&:hover": { bgcolor: "var(--k-hover, #F5F5F5)" },
+                "&.Mui-selected": {
+                  bgcolor: "var(--k-active, #E8E8E8)",
+                  color: TEXT_DARK,
+                },
+                "&.Mui-selected:hover": { bgcolor: "var(--k-active, #E0E0E0)" },
+              }}
+            >
+              {mode.icon}
+            </ToggleButton>
+          ))}
+        </ToggleButtonGroup>
 
         <Menu
           anchorEl={notificationAnchorEl}
@@ -540,39 +685,9 @@ export default function AppShell({
           )}
         </Menu>
 
-        <Menu
-          anchorEl={viewModeAnchor}
-          open={Boolean(viewModeAnchor)}
-          onClose={() => setViewModeAnchor(null)}
-          anchorOrigin={{ vertical: "bottom", horizontal: "left" }}
-          transformOrigin={{ vertical: "top", horizontal: "left" }}
-          PaperProps={{
-            sx: {
-              bgcolor: "var(--k-surface-bg, #FFFFFF)",
-              color: "var(--k-text, #202124)",
-              border: "1px solid var(--k-border, #E0E0E0)",
-            },
-          }}
-        >
-          {VIEW_MODES.map((mode) => (
-            <MenuItem
-              key={mode.id}
-              onClick={() => {
-                onViewModeChange?.(mode.id);
-                setViewModeAnchor(null);
-              }}
-              selected={viewMode === mode.id}
-              sx={{ fontSize: 13, gap: 1 }}
-            >
-              {mode.icon}
-              {t.viewModes[mode.id]}
-            </MenuItem>
-          ))}
-        </Menu>
-
         <Divider orientation="vertical" flexItem sx={{ mx: 1, borderColor: BORDER_GRAY }} />
 
-        {/* Кнопки навигации: Списки, Отчёты, Архив */}
+        {/* Кнопки навигации: Задачи, Отчёты, Архив */}
         <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }} data-testid="header-buttons">
           {[
             { id: "lists", label: t.lists },
@@ -603,18 +718,18 @@ export default function AppShell({
 
         <Box sx={{ flex: 1 }} />
 
-        {/* Кнопка Фильтры */}
+        {/* Кнопка Фильтры — попап фильтров задач */}
         <Button
           size="small"
           startIcon={<FilterListIcon fontSize="small" />}
-          onClick={() => onTabChange?.("filters")}
+          onClick={(e) => onOpenTaskFilters?.(e.currentTarget)}
           data-testid="header-btn-filters"
           sx={{
             textTransform: "none",
             fontWeight: 500,
             fontSize: 13,
-            color: activeTabId === "filters" ? TEXT_DARK : TEXT_GRAY,
-            bgcolor: activeTabId === "filters" ? "var(--k-active, #E8E8E8)" : "transparent",
+            color: TEXT_GRAY,
+            bgcolor: "transparent",
             borderRadius: 1,
             px: 1.5,
             mr: 1,
@@ -719,7 +834,6 @@ export default function AppShell({
           <MenuItem
             onClick={() => {
               setAddMenuAnchor(null);
-              onCreateBoardClick?.();
               onAddAction?.("board");
             }}
             sx={{ py: 1.5, gap: 1.5 }}
@@ -745,6 +859,15 @@ export default function AppShell({
             }}
           >
             <LeftSidebar
+              organizations={organizations}
+              activeOrganizationId={activeOrganizationId}
+              onSelectOrganization={onSelectOrganization}
+              canRenameOrganization={canRenameOrganization}
+              onRenameOrganization={onRenameOrganization}
+              organizationMembers={organizationMembers}
+              organizationMembersLoading={organizationMembersLoading}
+              currentUserId={currentUserId}
+              onOpenDirectMessage={onOpenDirectMessage}
               spaces={spaces}
               projects={projects}
               boards={boards}
@@ -756,6 +879,7 @@ export default function AppShell({
               onSelectProject={onSelectProject}
               onSelectBoard={onSelectBoard}
               onCreateSpace={() => onCreateSpaceClick?.()}
+              onCreateBoard={onCreateBoardClick}
               onRenameSpace={onRenameSpace}
               onRenameBoard={onRenameBoard}
               onDeleteSpace={onDeleteSpace}
@@ -790,6 +914,15 @@ export default function AppShell({
             }}
           >
             <LeftSidebar
+              organizations={organizations}
+              activeOrganizationId={activeOrganizationId}
+              onSelectOrganization={onSelectOrganization}
+              canRenameOrganization={canRenameOrganization}
+              onRenameOrganization={onRenameOrganization}
+              organizationMembers={organizationMembers}
+              organizationMembersLoading={organizationMembersLoading}
+              currentUserId={currentUserId}
+              onOpenDirectMessage={onOpenDirectMessage}
               spaces={spaces}
               projects={projects}
               boards={boards}
@@ -807,6 +940,10 @@ export default function AppShell({
               onSelectProject={onSelectProject}
               onCreateSpace={() => {
                 onCreateSpaceClick?.();
+                handleCloseSidebar();
+              }}
+              onCreateBoard={() => {
+                onCreateBoardClick?.();
                 handleCloseSidebar();
               }}
               onRenameSpace={onRenameSpace}
@@ -850,12 +987,7 @@ export default function AppShell({
         </Box>
 
         {/* Правый тонкий rail */}
-        <RightRail
-          activeTabId={activeTabId}
-          onTabChange={onTabChange}
-          unreadNotificationsCount={notificationCount}
-          language={language}
-        />
+        <RightRail activeTabId={activeTabId} onTabChange={onTabChange} language={language} />
       </Box>
 
       {/* Меню профиля */}
