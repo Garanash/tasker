@@ -157,6 +157,7 @@ type Props = {
   priority?: "Терпит" | "Средний" | "Срочно" | string | null;
   tags?: string[];
   assigneeName?: string | null;
+  assigneeAvatarUrl?: string | null;
   blockedCount?: number;
   blockingCount?: number;
   plannedEndAt?: string | null;
