@@ -1556,6 +1556,12 @@ async def board_grid(
     in_progress_col_id = col_id_by_name.get(WORKFLOW_IN_PROGRESS_COLUMN_NAME)
 
     by_col = {str(c["id"]): [] for c in columns}
+    valid_col_ids = set(by_col.keys())
+    fallback_column_id: str | None = None
+    if columns:
+        backlog_id = col_id_by_name.get(DEFAULT_BACKLOG_COLUMN_NAME)
+        fallback_column_id = str(backlog_id) if backlog_id and backlog_id in valid_col_ids else str(columns[0]["id"])
+
     for card in cards:
         cid = str(card["id"])
         meta = card_meta.get(cid, {})
@@ -1575,6 +1581,13 @@ async def board_grid(
         ):
             # Для manager/admin назначенная задача визуально считается «В работе».
             target_column_id = in_progress_col_id
+
+        if target_column_id not in valid_col_ids:
+            # Карточка ссылается на удалённую/чужую колонку — без падения сетки кладём в запасную.
+            if fallback_column_id and fallback_column_id in valid_col_ids:
+                target_column_id = fallback_column_id
+            else:
+                continue
 
         card_payload = _card_lite(card, meta)
         card_payload["column_id"] = target_column_id
